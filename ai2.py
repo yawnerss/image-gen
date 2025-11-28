@@ -12,6 +12,8 @@ import logging
 from aiohttp import web
 from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
 
+BOT_TOKEN = BOT_TOKEN or os.getenv("BOT_TOKEN")
+
 # Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -552,8 +554,6 @@ async def safe_edit(message, text, parse_mode='Markdown', retries=3):
                 return message
             logger.error(f"Error editing message: {e}")
             raise
-
-# ... existing bot command handlers (start, help, model, setmodel, etc.) ...
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -1189,7 +1189,7 @@ async def process_generation_queue():
                 try:
                     await safe_edit(
                         status_message,
-                        f"🎨 *Downloading {len(completed_tasks)} images...*\n\n"
+                        f"🎨 *Generating {len(completed_tasks)} images...*\n\n"
                         f"Prompt: `{prompt}`\n"
                         f"Status: Preparing to send..."
                     )
@@ -1336,9 +1336,10 @@ def main():
     """Start the bot"""
     try:
         if not BOT_TOKEN:
-            raise ValueError("BOT_TOKEN not set!")
+            raise ValueError("BOT_TOKEN not set in config.py or environment variables!")
 
         logger.info("Starting ClipFly Telegram Bot with Auto-Delete...")
+        logger.info(f"Using bot token: {BOT_TOKEN[:15]}...") # Log first 15 chars to avoid exposing full token
 
         if not os.path.exists(TOKEN_FILE):
             logger.warning(f"{TOKEN_FILE} not found. Creating empty file...")
@@ -1346,7 +1347,16 @@ def main():
 
         ImageStorage.ensure_directory()
 
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Using explicit parameter passing to avoid __slots__ issues
+        try:
+            application = Application.builder().token(BOT_TOKEN).build()
+        except AttributeError as e:
+            logger.error(f"Application initialization failed: {e}")
+            logger.info("Attempting alternative initialization method...")
+            # Fallback: Create application with explicit loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            application = Application.builder().token(BOT_TOKEN).build()
 
         application.add_error_handler(error_handler)
 
