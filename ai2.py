@@ -612,6 +612,7 @@ Welcome! I can generate AI images for you using ClipFly.
 *Commands:*
 /start - Show this message
 /gen <prompt> - Generate an image
+/status - Check if your image is generating
 /model - Choose AI model
 /mymodel - Show your current model
 /count - Set image count (1-10)
@@ -624,12 +625,13 @@ Welcome! I can generate AI images for you using ClipFly.
 *Features:*
 ✅ Queue system - Multiple users can request simultaneously
 ✅ Position tracking - See where you are in line
+✅ Status checking - Check if your image is generating
 ✅ Auto-delete - Images auto-deleted after sending to save space
 
 *Example:*
 `/gen a beautiful sunset over mountains`
 
-💡 *Tip:* Images are automatically deleted after being sent to save storage space!
+💡 *Tip:* Use `/status` to check if your image is currently generating!
 
 Let's create something amazing! 🚀
     """
@@ -647,14 +649,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "5. Use `/setcount <number>` to set default image count\n"
         "6. Use `/mycount` to see your current image count\n"
         "7. Use `/gen <prompt>` to generate images\n"
-        "8. Use `/queue` to check your position in queue\n"
-        "9. Use `/cancel` to stop current generation or remove from queue\n"
-        "10. Use `/tokens` to check available tokens\n\n"
+        "8. Use `/status` to check if your image is generating\n"
+        "9. Use `/queue` to check your position in queue\n"
+        "10. Use `/cancel` to stop current generation or remove from queue\n"
+        "11. Use `/tokens` to check available tokens\n\n"
         "🎯 *Queue System*\n"
         "• When you use `/gen`, you're added to the queue\n"
         "• You'll see your position (e.g., 'Position #3 out of 5')\n"
         "• The bot processes one generation at a time\n"
-        "• Use `/queue` to check your current status anytime\n\n"
+        "• Use `/queue` to check your current status anytime\n"
+        "• Use `/status` to see if your image is currently generating\n\n"
         "💡 *Tips:*\n"
         "• Set your preferred model and image count first\n"
         "• Images are perfect for manga/comic scenes\n"
@@ -931,6 +935,14 @@ async def process_generation_queue():
                     break
             
             logger.info(f"Processing generation for {username}: {image_count}x images")
+            
+            # Track active generation
+            active_generations[user_id] = {
+                'start_time': datetime.now().strftime("%H:%M:%S"),
+                'status': 'Starting...',
+                'prompt': prompt[:50],
+                'model': model_name
+            }
             
             # Notify user it's their turn
             try:
@@ -1289,6 +1301,10 @@ async def process_generation_queue():
             finally:
                 # Remove only THIS specific queue item (not all items for the user)
                 await QueueManager.remove_queue_item(queue_item)
+                
+                # Clean up active generation tracking
+                if user_id in active_generations:
+                    del active_generations[user_id]
         
         except Exception as e:
             logger.error(f"Error in queue processing: {e}")
@@ -1394,6 +1410,44 @@ async def mycount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Count: {current_image_count} image{'s' if current_image_count > 1 else ''}\n\n"
         f"Your next generation will produce {current_image_count} image{'s' if current_image_count > 1 else ''}.\n\n"
         f"Use `/setcount` to change it."
+    )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command - Check if user has active generation"""
+    user_id = update.effective_user.id
+    
+    # Check if user is in active generations
+    if user_id in active_generations:
+        status = active_generations[user_id]
+        await safe_reply(
+            update.message,
+            f"🎨 *Your Image is Generating!*\n\n"
+            f"Started: {status.get('start_time', 'Unknown')}\n"
+            f"Status: {status.get('status', 'Processing...')}\n\n"
+            f"Use /cancel to stop this generation."
+        )
+        return
+    
+    # Check queue position
+    position = await QueueManager.get_queue_position(user_id)
+    if position > 0:
+        await safe_reply(
+            update.message,
+            f"📊 *You're in the Queue*\n\n"
+            f"Position: #{position}\n\n"
+            f"Your image will start generating soon!\n"
+            f"Use /queue to see detailed queue status.\n"
+            f"Use /cancel to remove from queue."
+        )
+        return
+    
+    # Not generating or in queue
+    await safe_reply(
+        update.message,
+        f"✅ *No Active Generation*\n\n"
+        f"You're not currently generating any images.\n\n"
+        f"Use `/gen <prompt>` to start a new generation!"
     )
 
 
@@ -1670,6 +1724,7 @@ async def main():
         application.add_handler(CommandHandler("count", count_command))
         application.add_handler(CommandHandler("setcount", setcount_command))
         application.add_handler(CommandHandler("mycount", mycount_command))
+        application.add_handler(CommandHandler("status", status_command))
         application.add_handler(CommandHandler("gen", gen_command))
         application.add_handler(CommandHandler("cancel", cancel_command))
         application.add_handler(CommandHandler("queue", queue_command))
@@ -1688,7 +1743,9 @@ async def main():
         # Create a custom post_init to start queue processor
         async def start_queue_processor(app):
             """Start the queue processor after app initialization"""
+            logger.info("Starting queue processor task...")
             asyncio.create_task(process_generation_queue())
+            logger.info("✅ Queue processor task created")
         
         application.post_init = start_queue_processor
         
@@ -1708,6 +1765,10 @@ async def main():
         logger.info("Starting bot with polling mode...")
         await application.initialize()
         await application.start()
+        
+        # Manually start queue processor since post_init may not be called yet
+        logger.info("Manually starting queue processor...")
+        queue_processor_task = asyncio.create_task(process_generation_queue())
         
         # Try to get current offset to skip old messages
         try:
