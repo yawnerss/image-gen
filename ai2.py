@@ -1419,6 +1419,9 @@ def setup_ngrok():
         return None
 
 
+# Global event loop reference for Flask
+bot_event_loop = None
+
 def setup_flask_webhook(app_instance):
     """Setup Flask webhook endpoint"""
     
@@ -1430,13 +1433,14 @@ def setup_flask_webhook(app_instance):
             
             if data:
                 logger.debug(f"Webhook update received from Telegram")
-                # Process update through the application
-                asyncio.run_coroutine_threadsafe(
-                    app_instance.process_update(
-                        Update.de_json(data, app_instance.bot)
-                    ),
-                    asyncio.get_event_loop()
-                )
+                # Process update through the application in the bot event loop
+                if bot_event_loop and bot_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        app_instance.process_update(
+                            Update.de_json(data, app_instance.bot)
+                        ),
+                        bot_event_loop
+                    )
             
             return jsonify({'ok': True})
         except Exception as e:
@@ -1547,6 +1551,8 @@ def run_bot_with_restart():
 
 def main_bot_instance():
     """Main bot instance - called by restart wrapper"""
+    global bot_event_loop
+    
     # Create and acquire single instance lock
     instance_lock = SingleInstanceLock(".bot.lock")
     
@@ -1603,10 +1609,15 @@ def main_bot_instance():
         logger.info("Flask + ngrok mode: Using ngrok tunnel for webhooks")
         logger.info("24/7 Mode: Auto-restart enabled on crash")
         
+        # Create event loop for async operations
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        bot_event_loop = loop  # Set global reference
+        
         # Setup Flask webhook endpoints
         setup_flask_webhook(application)
         
-        # Start Flask server
+        # Start Flask server in background thread
         run_flask_server(port=5000)
         
         # Small delay to ensure Flask is ready
@@ -1639,16 +1650,25 @@ def main_bot_instance():
             except Exception as e:
                 logger.error(f"Error setting webhook: {e}")
         
-        # Run setup in new event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Run webhook setup in the event loop
         loop.run_until_complete(setup_webhook_ngrok())
         
-        # Keep the application running
+        # Start queue processor in background
+        asyncio.run_coroutine_threadsafe(process_generation_queue(), loop)
+        
+        # Run event loop in background thread
+        def run_event_loop():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        
+        loop_thread = threading.Thread(target=run_event_loop, daemon=True)
+        loop_thread.start()
+        logger.info("Event loop started in background thread")
+        
+        # Keep the main thread alive
         logger.info("Bot is now listening for updates via ngrok webhook...")
         logger.info("Press Ctrl+C to stop\n")
         
-        # Keep the main thread alive
         try:
             while True:
                 time.sleep(1)
