@@ -17,6 +17,8 @@ import logging
 from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+import fcntl
+import sys
 
 # Setup logging
 logging.basicConfig(
@@ -1478,12 +1480,59 @@ def start_http_server(port=8080):
     return server
 
 
+class SingleInstanceLock:
+    """Ensures only one instance of the bot runs at a time"""
+    
+    def __init__(self, lock_file=".bot.lock"):
+        self.lock_file = lock_file
+        self.lock_handle = None
+    
+    def acquire(self):
+        """Acquire the lock"""
+        try:
+            self.lock_handle = open(self.lock_file, 'w')
+            if os.name == 'nt':  # Windows
+                import msvcrt
+                msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # Unix-like
+                fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logger.info("✅ Single instance lock acquired")
+            return True
+        except (IOError, OSError, BlockingIOError) as e:
+            logger.error("❌ Bot is already running! Only one instance allowed.")
+            logger.error(f"Lock file: {self.lock_file}")
+            return False
+    
+    def release(self):
+        """Release the lock"""
+        try:
+            if self.lock_handle:
+                if os.name == 'nt':  # Windows
+                    import msvcrt
+                    msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # Unix-like
+                    fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+                self.lock_handle.close()
+                if os.path.exists(self.lock_file):
+                    os.remove(self.lock_file)
+                logger.info("Single instance lock released")
+        except Exception as e:
+            logger.error(f"Error releasing lock: {e}")
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     """Start the bot"""
+    # Create and acquire single instance lock
+    instance_lock = SingleInstanceLock(".bot.lock")
+    
+    if not instance_lock.acquire():
+        logger.error("Cannot start bot - another instance is already running!")
+        sys.exit(1)
+    
     try:
         if not BOT_TOKEN:
             raise ValueError("BOT_TOKEN not set in config.py!")
@@ -1529,6 +1578,7 @@ def main():
         logger.info("Bot is running with auto-delete feature enabled...")
         logger.info("Images will be automatically deleted after being sent to users")
         logger.info("Queue system activated - max 1 concurrent generation")
+        logger.info("Single instance mode: Only one bot instance allowed")
         
         # Start HTTP server for health checks
         http_server = start_http_server(port=8080)
@@ -1545,12 +1595,20 @@ def main():
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
-        raise
+        instance_lock.release()
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        instance_lock.release()
+        sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
-        raise
+        instance_lock.release()
+        sys.exit(1)
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
