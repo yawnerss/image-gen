@@ -10,19 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TimedOut, NetworkError, TelegramError
 import logging
 from aiohttp import web
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-BASE_URL = "https://www.clipfly.ai"
-TOKEN_FILE = "token.txt"
-IMAGES_DIR = "generated_images"
-MAX_WAIT_TIME = 120
-CHECK_INTERVAL = 2
-DEFAULT_MODEL = "nanobanana"
-
-AVAILABLE_MODELS = {
-    "1": {"id": "nanobanana", "name": "Nanobanana", "desc": "Fast, standard quality"},
-    "2": {"id": "nanobanana2", "name": "Nanobanana Pro", "desc": "Enhanced quality, slower"},
-}
+from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
 
 # Setup logging
 logging.basicConfig(
@@ -1190,7 +1178,7 @@ async def process_generation_queue():
                             status_message,
                             "⏱️ *Generation Timeout*\n\n"
                             f"Prompt: `{prompt}`\n"
-                            f"No images completed within {MAX_WAIT_TIME}s.\n\n"
+                            "No images completed within {MAX_WAIT_TIME}s.\n\n"
                             "Please try again."
                         )
                     except Exception:
