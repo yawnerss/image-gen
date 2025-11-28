@@ -1680,7 +1680,7 @@ async def main():
         logger.info("Images will be automatically deleted after being sent to users")
         logger.info("Queue system activated - max 1 concurrent generation")
         logger.info("Single instance mode: Only one bot instance allowed")
-        logger.info("Webhook mode: Using webhooks instead of polling")
+        logger.info("Polling mode: Using getUpdates polling (best for Render)")
         
         # Start HTTP server for health checks and webhooks
         http_server = start_http_server(port=8080)
@@ -1692,41 +1692,40 @@ async def main():
         
         application.post_init = start_queue_processor
         
-        # On production (Render), delete any existing webhook and use polling instead
-        # Webhooks require HTTPS certificates which are complex to setup
-        if os.getenv('RENDER'):
-            logger.info("Running on Render - using polling mode (deleting webhook)")
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=True)
-            except Exception as e:
-                logger.warning(f"Could not delete webhook: {e}")
-        else:
-            # Local development - try to setup webhook
-            webhook_url = f"{webhook_host}/webhook"
-            logger.info(f"Setting webhook URL: {webhook_url}")
-            
-            try:
-                await application.bot.set_webhook(
-                    url=webhook_url,
-                    allowed_updates=Update.ALL_TYPES
-                )
-                logger.info(f"✅ Webhook successfully set at: {webhook_url}")
-            except Exception as e:
-                logger.warning(f"Could not set webhook: {e} - falling back to polling")
+        # Clean up any existing webhook and update offset to avoid conflicts
+        logger.info("Cleaning up previous polling sessions...")
+        try:
+            # Delete any existing webhook
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook deleted (if existed)")
+        except Exception as e:
+            logger.warning(f"Could not delete webhook: {e}")
         
-        # Run the bot - will use polling if webhook not available
+        # Small delay to ensure previous session is fully terminated
+        await asyncio.sleep(1)
+        
+        # Run the bot with polling
         logger.info("Starting bot with polling mode...")
         await application.initialize()
         await application.start()
         
         try:
+            # Start polling with proper error handling for conflicts
+            logger.info("✅ Bot is now polling for updates...")
             await application.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
+                drop_pending_updates=True,
+                poll_interval=0.5,
+                timeout=10
             )
-            logger.info("✅ Bot is now polling for updates...")
-            await asyncio.Event().wait()  # Run forever
+            
+            # Keep the bot running
+            await asyncio.Event().wait()
+        except Exception as e:
+            logger.error(f"Error during polling: {e}")
+            raise
         finally:
+            logger.info("Stopping bot...")
             await application.updater.stop()
             await application.stop()
             await application.shutdown()
