@@ -1547,8 +1547,44 @@ class SingleInstanceLock:
 # MAIN
 # ============================================================================
 
-def main():
-    """Start the bot"""
+def run_bot_with_restart():
+    """Run the bot with automatic restart on failure (24/7 mode)"""
+    restart_count = 0
+    max_restart_attempts = None  # Infinite restarts
+    restart_delay = 5  # Initial delay in seconds
+    max_restart_delay = 300  # Max delay of 5 minutes
+    
+    while True:
+        restart_count += 1
+        
+        try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Bot startup attempt #{restart_count}")
+            logger.info(f"{'='*60}\n")
+            
+            main_bot_instance()
+            
+        except KeyboardInterrupt:
+            logger.info("\nBot stopped by user (Ctrl+C)")
+            break
+        except Exception as e:
+            logger.error(f"Bot crashed with error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Calculate restart delay with exponential backoff
+            current_delay = min(restart_delay * (2 ** (restart_count - 1)), max_restart_delay)
+            logger.info(f"Restarting in {current_delay} seconds... (Attempt {restart_count})")
+            
+            try:
+                time.sleep(current_delay)
+            except KeyboardInterrupt:
+                logger.info("\nBot stopped by user")
+                break
+
+
+def main_bot_instance():
+    """Main bot instance - called by restart wrapper"""
     # Create and acquire single instance lock
     instance_lock = SingleInstanceLock(".bot.lock")
     
@@ -1603,6 +1639,7 @@ def main():
         logger.info("Queue system activated - max 1 concurrent generation")
         logger.info("Single instance mode: Only one bot instance allowed")
         logger.info("Webhook mode: Using webhooks instead of polling")
+        logger.info("24/7 Mode: Auto-restart enabled on crash")
         
         # Start HTTP server for health checks and webhooks
         http_server = start_http_server(port=8080)
@@ -1615,11 +1652,16 @@ def main():
         application.post_init = start_queue_processor
         
         # Setup webhook
-        await application.bot.set_webhook(
-            url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
-            allowed_updates=Update.ALL_TYPES
-        )
-        logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
+        async def setup_webhook():
+            """Setup webhook asynchronously"""
+            try:
+                await application.bot.set_webhook(
+                    url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
+                    allowed_updates=Update.ALL_TYPES
+                )
+                logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
+            except Exception as e:
+                logger.error(f"Error setting webhook: {e}")
         
         # Run the bot with run_webhook
         application.run_webhook(
@@ -1634,19 +1676,27 @@ def main():
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         instance_lock.release()
-        sys.exit(1)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-        instance_lock.release()
-        sys.exit(0)
+        raise
     except Exception as e:
-        logger.error(f"Fatal error starting bot: {e}")
+        logger.error(f"Error in bot instance: {e}")
         import traceback
         traceback.print_exc()
         instance_lock.release()
-        sys.exit(1)
+        raise
     finally:
         instance_lock.release()
+
+
+def main():
+    """Entry point - runs bot with 24/7 restart support"""
+    logger.info("="*60)
+    logger.info("ClipFly Telegram Bot - 24/7 Mode")
+    logger.info("="*60)
+    logger.info("Auto-restart enabled: Bot will recover from crashes")
+    logger.info("Press Ctrl+C to stop permanently")
+    logger.info("="*60 + "\n")
+    
+    run_bot_with_restart()
 
 
 if __name__ == "__main__":
