@@ -1702,22 +1702,52 @@ async def main():
             logger.warning(f"Could not delete webhook: {e}")
         
         # Small delay to ensure previous session is fully terminated
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
         
         # Run the bot with polling
         logger.info("Starting bot with polling mode...")
         await application.initialize()
         await application.start()
         
+        # Try to get current offset to skip old messages
+        try:
+            logger.info("Syncing with Telegram API...")
+            updates = await application.bot.get_updates(timeout=5, allowed_updates=Update.ALL_TYPES)
+            if updates:
+                logger.info(f"Synced {len(updates)} pending updates")
+        except Exception as e:
+            logger.warning(f"Could not sync updates: {e}")
+        
         try:
             # Start polling with proper error handling for conflicts
             logger.info("✅ Bot is now polling for updates...")
-            await application.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                poll_interval=0.5,
-                timeout=10
-            )
+            
+            # Retry loop for handling initial conflicts from previous instances
+            max_retries = 5
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    await application.updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=False,
+                        poll_interval=1.0,
+                        timeout=10
+                    )
+                    # If we get here, polling started successfully
+                    break
+                except Exception as e:
+                    if "Conflict" in str(e) or "other getUpdates" in str(e):
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            wait_time = 5 * retry_count  # Exponential backoff: 5s, 10s, 15s, etc
+                            logger.warning(f"Conflict detected (attempt {retry_count}/{max_retries}). Retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.error(f"Failed to start polling after {max_retries} attempts")
+                            raise
+                    else:
+                        raise
             
             # Keep the bot running
             await asyncio.Event().wait()
