@@ -15,10 +15,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TimedOut, NetworkError, TelegramError
 import logging
 from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import fcntl
 import sys
+from flask import Flask, request, jsonify
+from pyngrok import ngrok
 
 # Setup logging
 logging.basicConfig(
@@ -26,6 +27,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Flask app for webhook
+flask_app = Flask(__name__)
 
 # Store active generation tasks
 active_generations = {}
@@ -1393,114 +1397,72 @@ async def mycount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================================
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for health checks, status monitoring, and webhooks"""
-    
-    def do_POST(self):
-        """Handle POST requests for webhooks"""
-        if self.path == '/webhook':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
-            
-            try:
-                logger.debug(f"Webhook received: {body[:100]}")
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                
-                response = {'ok': True}
-                self.wfile.write(json.dumps(response).encode())
-            except Exception as e:
-                logger.error(f"Error processing webhook: {e}")
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def do_GET(self):
-        """Handle GET requests"""
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            queue_size = len(generation_queue)
-            response = {
-                'status': 'healthy',
-                'bot': 'ClipFly AI Image Generator',
-                'queue_size': queue_size,
-                'available_tokens': len(TokenManager.load_tokens()),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        elif self.path == '/queue':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            queue_data = []
-            for i, item in enumerate(generation_queue, 1):
-                queue_data.append({
-                    'position': i,
-                    'user_id': item['user_id'],
-                    'username': item['username'],
-                    'prompt': item['prompt'][:50],
-                    'model': item['model_id'],
-                    'status': 'processing' if item['started'] else 'waiting'
-                })
-            
-            response = {
-                'queue_size': len(generation_queue),
-                'items': queue_data,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        elif self.path == '/stats':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            response = {
-                'bot': 'ClipFly AI Image Generator',
-                'queue_size': len(generation_queue),
-                'available_tokens': len(TokenManager.load_tokens()),
-                'active_users': len(active_generations),
-                'total_users_in_queue': len(set(item['user_id'] for item in generation_queue)),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            response = {
-                'error': 'Endpoint not found',
-                'available_endpoints': ['/health', '/queue', '/stats', '/webhook'],
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-    
-    def log_message(self, format, *args):
-        """Suppress HTTP server logging"""
-        pass
 
 
-def start_http_server(port=8080):
-    """Start HTTP server in a separate thread"""
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+
+
+def setup_ngrok():
+    """Setup ngrok tunnel and return public URL"""
+    try:
+        # Hardcoded ngrok token
+        ngrok_token = "2tg4R7Z2XMTRvYB0xVnahf5HSyT_4r1TrduzXeusci4Q7VXgY"
+        ngrok.set_auth_token(ngrok_token)
+        logger.info("✅ ngrok authentication token configured")
+        
+        # Open ngrok tunnel on port 5000
+        public_url = ngrok.connect(5000, "http").public_url
+        logger.info(f"✅ ngrok tunnel established: {public_url}")
+        return public_url
+    except Exception as e:
+        logger.error(f"❌ ngrok setup failed: {e}")
+        logger.info("Make sure pyngrok is installed: pip install pyngrok")
+        return None
+
+
+def setup_flask_webhook(app_instance):
+    """Setup Flask webhook endpoint"""
+    
+    @flask_app.route('/webhook', methods=['POST'])
+    def telegram_webhook():
+        """Handle incoming Telegram updates via webhook"""
+        try:
+            data = request.get_json()
+            
+            if data:
+                logger.debug(f"Webhook update received from Telegram")
+                # Process update through the application
+                asyncio.run_coroutine_threadsafe(
+                    app_instance.process_update(
+                        Update.de_json(data, app_instance.bot)
+                    ),
+                    asyncio.get_event_loop()
+                )
+            
+            return jsonify({'ok': True})
+        except Exception as e:
+            logger.error(f"Error processing webhook: {e}")
+            return jsonify({'ok': False, 'error': str(e)}), 500
+    
+    @flask_app.route('/health', methods=['GET'])
+    def health_check():
+        """Health check endpoint"""
+        return jsonify({
+            'status': 'healthy',
+            'bot': 'ClipFly AI Image Generator',
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    logger.info("Flask webhook endpoints configured")
+
+
+def run_flask_server(port=5000):
+    """Run Flask server in a separate thread"""
+    def run():
+        flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    
+    thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    logger.info(f"HTTP Server started on port {port}")
-    logger.info(f"Health check: http://localhost:{port}/health")
-    logger.info(f"Queue status: http://localhost:{port}/queue")
-    logger.info(f"Statistics: http://localhost:{port}/stats")
-    return server
+    logger.info(f"Flask server started on port {port}")
 
 
 class SingleInstanceLock:
@@ -1638,11 +1600,24 @@ def main_bot_instance():
         logger.info("Images will be automatically deleted after being sent to users")
         logger.info("Queue system activated - max 1 concurrent generation")
         logger.info("Single instance mode: Only one bot instance allowed")
-        logger.info("Webhook mode: Using webhooks instead of polling")
+        logger.info("Flask + ngrok mode: Using ngrok tunnel for webhooks")
         logger.info("24/7 Mode: Auto-restart enabled on crash")
         
-        # Start HTTP server for health checks and webhooks
-        http_server = start_http_server(port=8080)
+        # Setup Flask webhook endpoints
+        setup_flask_webhook(application)
+        
+        # Start Flask server
+        run_flask_server(port=5000)
+        
+        # Small delay to ensure Flask is ready
+        time.sleep(1)
+        
+        # Setup ngrok tunnel
+        public_url = setup_ngrok()
+        
+        if not public_url:
+            logger.warning("ngrok tunnel not available, attempting local setup...")
+            public_url = "http://localhost:5000"
         
         # Create a custom post_init to start queue processor
         async def start_queue_processor(app):
@@ -1651,27 +1626,35 @@ def main_bot_instance():
         
         application.post_init = start_queue_processor
         
-        # Setup webhook
-        async def setup_webhook():
-            """Setup webhook asynchronously"""
+        # Setup webhook with ngrok URL
+        async def setup_webhook_ngrok():
+            """Setup webhook with ngrok URL"""
             try:
+                webhook_url = f"{public_url}/webhook"
                 await application.bot.set_webhook(
-                    url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
+                    url=webhook_url,
                     allowed_updates=Update.ALL_TYPES
                 )
-                logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
+                logger.info(f"✅ Webhook set up at: {webhook_url}")
             except Exception as e:
                 logger.error(f"Error setting webhook: {e}")
         
-        # Run the bot with run_webhook
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=8443,
-            url_path="/webhook",
-            key=os.getenv('WEBHOOK_KEY', None),
-            cert=os.getenv('WEBHOOK_CERT', None),
-            drop_pending_updates=True
-        )
+        # Run setup in new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_webhook_ngrok())
+        
+        # Keep the application running
+        logger.info("Bot is now listening for updates via ngrok webhook...")
+        logger.info("Press Ctrl+C to stop\n")
+        
+        # Keep the main thread alive
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            raise
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
