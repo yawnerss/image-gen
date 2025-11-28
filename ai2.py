@@ -1625,6 +1625,29 @@ async def main():
         # Create images directory
         ImageStorage.ensure_directory()
         
+        # Detect webhook host - use Render's external URL if available
+        webhook_host = os.getenv('RENDER_EXTERNAL_URL')
+        if not webhook_host:
+            # Fallback to WEBHOOK_HOST env var or use ngrok
+            webhook_host = os.getenv('WEBHOOK_HOST')
+            if not webhook_host:
+                logger.warning("Neither RENDER_EXTERNAL_URL nor WEBHOOK_HOST set - using ngrok...")
+                # In production on Render, this shouldn't happen
+                webhook_host = "localhost"
+        
+        # Remove trailing slash if present
+        if webhook_host.endswith('/'):
+            webhook_host = webhook_host.rstrip('/')
+        
+        # Ensure HTTPS for Telegram webhook
+        if not webhook_host.startswith('http'):
+            if webhook_host != 'localhost':
+                webhook_host = f"https://{webhook_host}"
+            else:
+                webhook_host = f"http://{webhook_host}"
+        
+        logger.info(f"Webhook host configured: {webhook_host}")
+        
         # Create application with custom settings for better timeout handling
         application = (
             Application.builder()
@@ -1669,22 +1692,44 @@ async def main():
         
         application.post_init = start_queue_processor
         
-        # Setup webhook
-        await application.bot.set_webhook(
-            url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
-            allowed_updates=Update.ALL_TYPES
-        )
-        logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
+        # On production (Render), delete any existing webhook and use polling instead
+        # Webhooks require HTTPS certificates which are complex to setup
+        if os.getenv('RENDER'):
+            logger.info("Running on Render - using polling mode (deleting webhook)")
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logger.warning(f"Could not delete webhook: {e}")
+        else:
+            # Local development - try to setup webhook
+            webhook_url = f"{webhook_host}/webhook"
+            logger.info(f"Setting webhook URL: {webhook_url}")
+            
+            try:
+                await application.bot.set_webhook(
+                    url=webhook_url,
+                    allowed_updates=Update.ALL_TYPES
+                )
+                logger.info(f"✅ Webhook successfully set at: {webhook_url}")
+            except Exception as e:
+                logger.warning(f"Could not set webhook: {e} - falling back to polling")
         
-        # Run the bot with run_webhook
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=8443,
-            url_path="/webhook",
-            key=os.getenv('WEBHOOK_KEY', None),
-            cert=os.getenv('WEBHOOK_CERT', None),
-            drop_pending_updates=True
-        )
+        # Run the bot - will use polling if webhook not available
+        logger.info("Starting bot with polling mode...")
+        await application.initialize()
+        await application.start()
+        
+        try:
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            logger.info("✅ Bot is now polling for updates...")
+            await asyncio.Event().wait()  # Run forever
+        finally:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
