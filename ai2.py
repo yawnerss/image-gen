@@ -15,6 +15,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TimedOut, NetworkError, TelegramError
 import logging
 from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import fcntl
 import sys
@@ -31,13 +32,16 @@ logger = logging.getLogger(__name__)
 # Flask app for webhook
 flask_app = Flask(__name__)
 
+# Global event loop reference for Flask
+bot_event_loop = None
+
 # Store active generation tasks
 active_generations = {}
 
 # Store user model preferences
 user_models = {}
 
-# Store user image count preferences (1-10 images)
+# Store user image count preferences (1-10 images)x
 user_image_counts = {}
 
 # Queue system for generation requests
@@ -1397,30 +1401,103 @@ async def mycount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================================
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for health checks, status monitoring, and webhooks"""
+    
+    def do_POST(self):
+        """Handle POST requests for webhooks"""
+        if self.path == '/webhook':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                logger.debug(f"Webhook received: {body[:100]}")
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {'ok': True}
+                self.wfile.write(json.dumps(response).encode())
+            except Exception as e:
+                logger.error(f"Error processing webhook: {e}")
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            queue_size = len(generation_queue)
+            response = {
+                'status': 'healthy',
+                'bot': 'ClipFly AI Image Generator',
+                'queue_size': queue_size,
+                'available_tokens': len(TokenManager.load_tokens()),
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+            
+        elif self.path == '/queue':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            queue_data = []
+            for i, item in enumerate(generation_queue, 1):
+                queue_data.append({
+                    'position': i,
+                    'user_id': item['user_id'],
+                    'username': item['username'],
+                    'prompt': item['prompt'][:50],
+                    'model': item['model_id'],
+                    'status': 'processing' if item['started'] else 'waiting'
+                })
+            
+            response = {
+                'queue_size': len(generation_queue),
+                'items': queue_data,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+            
+        elif self.path == '/stats':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            response = {
+                'bot': 'ClipFly AI Image Generator',
+                'queue_size': len(generation_queue),
+                'available_tokens': len(TokenManager.load_tokens()),
+                'active_users': len(active_generations),
+                'total_users_in_queue': len(set(item['user_id'] for item in generation_queue)),
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+            
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            response = {
+                'error': 'Endpoint not found',
+                'available_endpoints': ['/health', '/queue', '/stats', '/webhook'],
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+    
+    def log_message(self, format, *args):
+        """Suppress HTTP server logging"""
+        pass
 
-
-
-
-def setup_ngrok():
-    """Setup ngrok tunnel and return public URL"""
-    try:
-        # Hardcoded ngrok token
-        ngrok_token = "2tg4R7Z2XMTRvYB0xVnahf5HSyT_4r1TrduzXeusci4Q7VXgY"
-        ngrok.set_auth_token(ngrok_token)
-        logger.info("✅ ngrok authentication token configured")
-        
-        # Open ngrok tunnel on port 5000
-        public_url = ngrok.connect(5000, "http").public_url
-        logger.info(f"✅ ngrok tunnel established: {public_url}")
-        return public_url
-    except Exception as e:
-        logger.error(f"❌ ngrok setup failed: {e}")
-        logger.info("Make sure pyngrok is installed: pip install pyngrok")
-        return None
-
-
-# Global event loop reference for Flask
-bot_event_loop = None
 
 def setup_flask_webhook(app_instance):
     """Setup Flask webhook endpoint"""
@@ -1469,6 +1546,18 @@ def run_flask_server(port=5000):
     logger.info(f"Flask server started on port {port}")
 
 
+def start_http_server(port=8080):
+    """Start HTTP server in a separate thread"""
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"HTTP Server started on port {port}")
+    logger.info(f"Health check: http://localhost:{port}/health")
+    logger.info(f"Queue status: http://localhost:{port}/queue")
+    logger.info(f"Statistics: http://localhost:{port}/stats")
+    return server
+
+
 class SingleInstanceLock:
     """Ensures only one instance of the bot runs at a time"""
     
@@ -1513,46 +1602,8 @@ class SingleInstanceLock:
 # MAIN
 # ============================================================================
 
-def run_bot_with_restart():
-    """Run the bot with automatic restart on failure (24/7 mode)"""
-    restart_count = 0
-    max_restart_attempts = None  # Infinite restarts
-    restart_delay = 5  # Initial delay in seconds
-    max_restart_delay = 300  # Max delay of 5 minutes
-    
-    while True:
-        restart_count += 1
-        
-        try:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Bot startup attempt #{restart_count}")
-            logger.info(f"{'='*60}\n")
-            
-            main_bot_instance()
-            
-        except KeyboardInterrupt:
-            logger.info("\nBot stopped by user (Ctrl+C)")
-            break
-        except Exception as e:
-            logger.error(f"Bot crashed with error: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Calculate restart delay with exponential backoff
-            current_delay = min(restart_delay * (2 ** (restart_count - 1)), max_restart_delay)
-            logger.info(f"Restarting in {current_delay} seconds... (Attempt {restart_count})")
-            
-            try:
-                time.sleep(current_delay)
-            except KeyboardInterrupt:
-                logger.info("\nBot stopped by user")
-                break
-
-
-def main_bot_instance():
-    """Main bot instance - called by restart wrapper"""
-    global bot_event_loop
-    
+async def main():
+    """Start the bot - async version"""
     # Create and acquire single instance lock
     instance_lock = SingleInstanceLock(".bot.lock")
     
@@ -1606,29 +1657,10 @@ def main_bot_instance():
         logger.info("Images will be automatically deleted after being sent to users")
         logger.info("Queue system activated - max 1 concurrent generation")
         logger.info("Single instance mode: Only one bot instance allowed")
-        logger.info("Flask + ngrok mode: Using ngrok tunnel for webhooks")
-        logger.info("24/7 Mode: Auto-restart enabled on crash")
+        logger.info("Webhook mode: Using webhooks instead of polling")
         
-        # Create event loop for async operations
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot_event_loop = loop  # Set global reference
-        
-        # Setup Flask webhook endpoints
-        setup_flask_webhook(application)
-        
-        # Start Flask server in background thread
-        run_flask_server(port=5000)
-        
-        # Small delay to ensure Flask is ready
-        time.sleep(1)
-        
-        # Setup ngrok tunnel
-        public_url = setup_ngrok()
-        
-        if not public_url:
-            logger.warning("ngrok tunnel not available, attempting local setup...")
-            public_url = "http://localhost:5000"
+        # Start HTTP server for health checks and webhooks
+        http_server = start_http_server(port=8080)
         
         # Create a custom post_init to start queue processor
         async def start_queue_processor(app):
@@ -1637,70 +1669,40 @@ def main_bot_instance():
         
         application.post_init = start_queue_processor
         
-        # Setup webhook with ngrok URL
-        async def setup_webhook_ngrok():
-            """Setup webhook with ngrok URL"""
-            try:
-                webhook_url = f"{public_url}/webhook"
-                await application.bot.set_webhook(
-                    url=webhook_url,
-                    allowed_updates=Update.ALL_TYPES
-                )
-                logger.info(f"✅ Webhook set up at: {webhook_url}")
-            except Exception as e:
-                logger.error(f"Error setting webhook: {e}")
+        # Setup webhook
+        await application.bot.set_webhook(
+            url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
+            allowed_updates=Update.ALL_TYPES
+        )
+        logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
         
-        # Run webhook setup in the event loop
-        loop.run_until_complete(setup_webhook_ngrok())
-        
-        # Start queue processor in background
-        asyncio.run_coroutine_threadsafe(process_generation_queue(), loop)
-        
-        # Run event loop in background thread
-        def run_event_loop():
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-        
-        loop_thread = threading.Thread(target=run_event_loop, daemon=True)
-        loop_thread.start()
-        logger.info("Event loop started in background thread")
-        
-        # Keep the main thread alive
-        logger.info("Bot is now listening for updates via ngrok webhook...")
-        logger.info("Press Ctrl+C to stop\n")
-        
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            raise
+        # Run the bot with run_webhook
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=8443,
+            url_path="/webhook",
+            key=os.getenv('WEBHOOK_KEY', None),
+            cert=os.getenv('WEBHOOK_CERT', None),
+            drop_pending_updates=True
+        )
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         instance_lock.release()
-        raise
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+        instance_lock.release()
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"Error in bot instance: {e}")
+        logger.error(f"Fatal error starting bot: {e}")
         import traceback
         traceback.print_exc()
         instance_lock.release()
-        raise
+        sys.exit(1)
     finally:
         instance_lock.release()
 
 
-def main():
-    """Entry point - runs bot with 24/7 restart support"""
-    logger.info("="*60)
-    logger.info("ClipFly Telegram Bot - 24/7 Mode")
-    logger.info("="*60)
-    logger.info("Auto-restart enabled: Bot will recover from crashes")
-    logger.info("Press Ctrl+C to stop permanently")
-    logger.info("="*60 + "\n")
-    
-    run_bot_with_restart()
-
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
