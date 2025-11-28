@@ -1394,7 +1394,30 @@ async def mycount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for health checks and status monitoring"""
+    """HTTP request handler for health checks, status monitoring, and webhooks"""
+    
+    def do_POST(self):
+        """Handle POST requests for webhooks"""
+        if self.path == '/webhook':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                logger.debug(f"Webhook received: {body[:100]}")
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {'ok': True}
+                self.wfile.write(json.dumps(response).encode())
+            except Exception as e:
+                logger.error(f"Error processing webhook: {e}")
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
     
     def do_GET(self):
         """Handle GET requests"""
@@ -1458,7 +1481,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             
             response = {
                 'error': 'Endpoint not found',
-                'available_endpoints': ['/health', '/queue', '/stats'],
+                'available_endpoints': ['/health', '/queue', '/stats', '/webhook'],
                 'timestamp': datetime.now().isoformat()
             }
             self.wfile.write(json.dumps(response).encode())
@@ -1579,8 +1602,9 @@ def main():
         logger.info("Images will be automatically deleted after being sent to users")
         logger.info("Queue system activated - max 1 concurrent generation")
         logger.info("Single instance mode: Only one bot instance allowed")
+        logger.info("Webhook mode: Using webhooks instead of polling")
         
-        # Start HTTP server for health checks
+        # Start HTTP server for health checks and webhooks
         http_server = start_http_server(port=8080)
         
         # Create a custom post_init to start queue processor
@@ -1590,8 +1614,22 @@ def main():
         
         application.post_init = start_queue_processor
         
-        # Run the bot with run_polling
-        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        # Setup webhook
+        await application.bot.set_webhook(
+            url=f"https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook",
+            allowed_updates=Update.ALL_TYPES
+        )
+        logger.info(f"Webhook set up at: https://{os.getenv('WEBHOOK_HOST', 'localhost')}/webhook")
+        
+        # Run the bot with run_webhook
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=8443,
+            url_path="/webhook",
+            key=os.getenv('WEBHOOK_KEY', None),
+            cert=os.getenv('WEBHOOK_CERT', None),
+            drop_pending_updates=True
+        )
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
