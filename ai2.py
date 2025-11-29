@@ -1,3 +1,4 @@
+```py file="main.py"
 """
 ClipFly Telegram Bot - Fixed Version with Auto-Delete
 Generates AI images through Telegram using ClipFly API with automatic token management
