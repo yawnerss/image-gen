@@ -1,4 +1,3 @@
-```py file="main.py"
 """
 ClipFly Telegram Bot - Fixed Version with Auto-Delete
 Generates AI images through Telegram using ClipFly API with automatic token management
@@ -1842,3 +1841,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
