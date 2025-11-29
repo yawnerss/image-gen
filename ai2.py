@@ -1,5 +1,5 @@
 """
-ClipFly Telegram Bot - Fixed Version with Auto-Delete + 24/7 Auto-Ping
+ClipFly Telegram Bot - Polling Mode with Queue System + 24/7 Auto-Ping
 Generates AI images through Telegram using ClipFly API with automatic token management
 Images are automatically deleted after being sent to save storage space
 Auto-ping keeps the bot alive 24/7 on Render by pinging health endpoint every 5 minutes
@@ -1208,21 +1208,21 @@ async def process_generation_queue():
                             failed_count += 1
                             continue
                         
-                        logger.info(f"[v0] Image {img_num} URL: {image_url}")
+                        logger.info(f"Image {img_num} URL: {image_url}")
                         
                         try:
-                            logger.info(f"[v0] Attempting to send image {img_num} via direct URL")
+                            logger.info(f"Attempting to send image {img_num} via direct URL")
                             await update.message.reply_photo(photo=image_url)
                             sent_count += 1
                             logger.info(f"✅ Successfully sent image {img_num} via direct URL")
                             continue
                         except Exception as url_error:
-                            logger.warning(f"[v0] Direct URL send failed for image {img_num}: {url_error}")
+                            logger.warning(f"Direct URL send failed for image {img_num}: {url_error}")
                         
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"{user_id}_{timestamp}_{img_num}.png"
                         
-                        logger.info(f"[v0] Downloading image {img_num} to {filename}")
+                        logger.info(f"Downloading image {img_num} to {filename}")
                         filepath = ImageStorage.download_image(image_url, filename)
                         
                         if not filepath:
@@ -1231,7 +1231,7 @@ async def process_generation_queue():
                             continue
                         
                         try:
-                            logger.info(f"[v0] Sending downloaded image {img_num} from {filepath}")
+                            logger.info(f"Sending downloaded image {img_num} from {filepath}")
                             with open(filepath, 'rb') as photo:
                                 await update.message.reply_photo(photo=photo)
                             
@@ -1454,111 +1454,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
-# HTTP SERVER WITH AUTO-PING
+# AUTO-PING SERVICE (Optional HTTP endpoint monitoring)
 # ============================================================================
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for health checks and status monitoring"""
-    
-    def do_GET(self):
-        """Handle GET requests"""
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            queue_size = len(generation_queue)
-            response = {
-                'status': 'healthy',
-                'bot': 'ClipFly AI Image Generator',
-                'queue_size': queue_size,
-                'available_tokens': len(TokenManager.load_tokens()),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-        
-        elif self.path == '/queue':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            queue_data = []
-            for i, item in enumerate(generation_queue, 1):
-                queue_data.append({
-                    'position': i,
-                    'user_id': item['user_id'],
-                    'username': item['username'],
-                    'prompt': item['prompt'][:50],
-                    'model': item['model_id'],
-                    'status': 'processing' if item['started'] else 'waiting'
-                })
-            
-            response = {
-                'queue_size': len(generation_queue),
-                'items': queue_data,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-        
-        elif self.path == '/stats':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            response = {
-                'bot': 'ClipFly AI Image Generator',
-                'queue_size': len(generation_queue),
-                'available_tokens': len(TokenManager.load_tokens()),
-                'active_users': len(active_generations),
-                'total_users_in_queue': len(set(item['user_id'] for item in generation_queue)),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-        
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            response = {
-                'error': 'Endpoint not found',
-                'available_endpoints': ['/health', '/queue', '/stats'],
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-    
-    def log_message(self, format, *args):
-        """Suppress HTTP server logging"""
-        pass
-
-
-def start_http_server(port=8080):
-    """Start HTTP server in a separate thread"""
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info(f"HTTP Server started on port {port}")
-    logger.info(f"Health check: http://localhost:{port}/health")
-    logger.info(f"Queue status: http://localhost:{port}/queue")
-    logger.info(f"Statistics: http://localhost:{port}/stats")
-    return server
-
-
 async def auto_ping_service():
-    """Background task that pings the health endpoint every 5 minutes to prevent Render spin-down"""
-    await asyncio.sleep(10)  # Wait 10 seconds for HTTP server to fully start
+    """Background task that keeps the service alive by periodic operations"""
+    await asyncio.sleep(10)  # Wait 10 seconds before starting
     
     while True:
         try:
-            response = requests.get('http://localhost:8080/health', timeout=5)
-            if response.status_code == 200:
-                logger.info(f"Auto-ping successful - service alive: {response.json().get('status')}")
-            else:
-                logger.warning(f"Auto-ping returned status {response.status_code}")
+            # Simple health check - just log that we're alive
+            queue_size = await QueueManager.get_queue_size()
+            logger.info(f"[Health] Bot alive - Queue size: {queue_size}, Active users: {len(active_generations)}")
         except Exception as e:
-            logger.warning(f"Auto-ping failed (will retry): {e}")
+            logger.warning(f"Auto-ping failed: {e}")
         
-        # Ping every 5 minutes to keep service active
+        # Run every 5 minutes to keep service active on platforms like Render
         await asyncio.sleep(300)
 
 
@@ -1606,7 +1517,7 @@ class SingleInstanceLock:
 # ============================================================================
 
 async def main():
-    """Start the bot - async version"""
+    """Start the bot with polling mode"""
     # Create and acquire single instance lock
     instance_lock = SingleInstanceLock(".bot.lock")
     
@@ -1618,7 +1529,10 @@ async def main():
         if not BOT_TOKEN:
             raise ValueError("BOT_TOKEN not set in config.py!")
         
-        logger.info("Starting ClipFly Telegram Bot with Auto-Delete + 24/7 Auto-Ping...")
+        logger.info("=" * 60)
+        logger.info("Starting ClipFly Telegram Bot - POLLING MODE")
+        logger.info("Features: Queue System + Auto-Delete + 24/7 Keep-Alive")
+        logger.info("=" * 60)
         
         # Check for token file
         if not os.path.exists(TOKEN_FILE):
@@ -1641,7 +1555,7 @@ async def main():
         # Add error handler
         application.add_error_handler(error_handler)
         
-        # Add handlers
+        # Add all command handlers
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("model", model_command))
@@ -1656,23 +1570,19 @@ async def main():
         application.add_handler(CommandHandler("queue", queue_command))
         application.add_handler(CommandHandler("tokens", tokens_command))
         
-        logger.info("Bot is running with auto-delete feature enabled...")
-        logger.info("Images auto-deleted after being sent to save storage space")
-        logger.info("Queue system activated - max 1 concurrent generation")
-        logger.info("Single instance mode: Only one bot instance allowed")
-        logger.info("24/7 Auto-Ping enabled - pings health endpoint every 5 minutes")
+        logger.info("✅ Queue system enabled - Max 1 concurrent generation")
+        logger.info("✅ Auto-delete enabled - Images deleted after sending")
+        logger.info("✅ Single instance mode - Only one bot instance allowed")
+        logger.info("✅ 24/7 Keep-alive enabled - Periodic health checks")
         
-        # Start HTTP server for health checks
-        http_server = start_http_server(port=8080)
-        
-        logger.info("Initializing bot application...")
+        logger.info("\nInitializing bot application...")
         await application.initialize()
         
-        # Clean up any existing webhook and stale polling sessions
-        logger.info("Cleaning up previous polling sessions...")
+        # Clean up any existing webhook
+        logger.info("Cleaning up previous webhook/polling sessions...")
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Webhook deleted (if existed)")
+            logger.info("Previous webhook deleted (if existed)")
         except Exception as e:
             logger.warning(f"Could not delete webhook: {e}")
         
@@ -1681,14 +1591,19 @@ async def main():
         logger.info("Starting bot application...")
         await application.start()
         
+        # Start background tasks
         logger.info("Starting background tasks...")
         asyncio.create_task(process_generation_queue())
         asyncio.create_task(auto_ping_service())
-        logger.info("Background tasks started: Queue Processor + Auto-Ping Service")
+        logger.info("✅ Background tasks started")
         
         try:
-            logger.info("Bot is now polling for updates with auto-ping active...")
+            logger.info("\n" + "=" * 60)
+            logger.info("🚀 BOT IS NOW RUNNING IN POLLING MODE 🚀")
+            logger.info("=" * 60)
+            logger.info("Waiting for Telegram updates...")
             
+            # Start polling with retry logic for connection conflicts
             max_retries = 8
             retry_count = 0
             initial_wait = 3
@@ -1699,11 +1614,11 @@ async def main():
                     
                     await application.updater.start_polling(
                         allowed_updates=Update.ALL_TYPES,
-                        drop_pending_updates=True,  # Drop pending to avoid stale messages
+                        drop_pending_updates=True,
                         poll_interval=1.0,
                         timeout=10
                     )
-                    logger.info("Polling started successfully!")
+                    logger.info("✅ Polling started successfully!")
                     break
                 
                 except Exception as e:
@@ -1712,23 +1627,21 @@ async def main():
                     if "Conflict" in error_str or "getUpdates" in error_str:
                         retry_count += 1
                         if retry_count < max_retries:
-                            # Exponential backoff: 3s, 6s, 12s, 24s, etc.
                             wait_time = initial_wait * (2 ** (retry_count - 1))
-                            wait_time = min(wait_time, 60)  # Cap at 60 seconds
+                            wait_time = min(wait_time, 60)
                             
-                            logger.warning(f"Conflict: Another getUpdates session detected")
-                            logger.warning(f"Attempt {retry_count}/{max_retries} - Waiting {wait_time}s before retry...")
+                            logger.warning(f"⚠️ Conflict: Another getUpdates session detected")
+                            logger.warning(f"Attempt {retry_count}/{max_retries} - Waiting {wait_time}s...")
                             
                             await asyncio.sleep(wait_time)
                         else:
                             logger.error(f"Failed to start polling after {max_retries} attempts")
                             raise
                     else:
-                        # Other error - re-raise immediately
-                        logger.error(f"Polling error (not a conflict): {error_str}")
+                        logger.error(f"Polling error: {error_str}")
                         raise
             
-            # Keep the bot running
+            # Keep the bot running indefinitely
             await asyncio.Event().wait()
         
         except Exception as e:
@@ -1736,7 +1649,7 @@ async def main():
             raise
         
         finally:
-            logger.info("Stopping bot...")
+            logger.info("\nStopping bot...")
             await application.updater.stop()
             await application.stop()
             await application.shutdown()
@@ -1746,11 +1659,11 @@ async def main():
         instance_lock.release()
         sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("\n✅ Bot stopped by user")
         instance_lock.release()
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Fatal error starting bot: {e}")
+        logger.error(f"Fatal error: {e}")
         import traceback
         traceback.print_exc()
         instance_lock.release()
