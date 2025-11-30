@@ -1525,108 +1525,104 @@ async def main():
         logger.error("Cannot start bot - another instance is already running!")
         sys.exit(1)
     
-    try:
-        if not BOT_TOKEN:
-            raise ValueError("BOT_TOKEN not set in config.py!")
-        
-        logger.info("=" * 60)
-        logger.info("Starting ClipFly Telegram Bot - POLLING MODE")
-        logger.info("Features: Queue System + Auto-Delete + 24/7 Keep-Alive")
-        logger.info("=" * 60)
-        
-        # Check for token file
-        if not os.path.exists(TOKEN_FILE):
-            logger.warning(f"{TOKEN_FILE} not found. Creating empty file...")
-            open(TOKEN_FILE, 'w').close()
-        
-        # Create images directory
-        ImageStorage.ensure_directory()
-        
-        # Create application
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .connect_timeout(30)
-            .read_timeout(30)
-            .write_timeout(30)
-            .build()
-        )
-        
-        # Add error handler
-        application.add_error_handler(error_handler)
-        
-        # Add all command handlers
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("model", model_command))
-        application.add_handler(CommandHandler("setmodel", setmodel_command))
-        application.add_handler(CommandHandler("mymodel", mymodel_command))
-        application.add_handler(CommandHandler("count", count_command))
-        application.add_handler(CommandHandler("setcount", setcount_command))
-        application.add_handler(CommandHandler("mycount", mycount_command))
-        application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("gen", gen_command))
-        application.add_handler(CommandHandler("cancel", cancel_command))
-        application.add_handler(CommandHandler("queue", queue_command))
-        application.add_handler(CommandHandler("tokens", tokens_command))
-        
-        logger.info("✅ Queue system enabled - Max 1 concurrent generation")
-        logger.info("✅ Auto-delete enabled - Images deleted after sending")
-        logger.info("✅ Single instance mode - Only one bot instance allowed")
-        logger.info("✅ 24/7 Keep-alive enabled - Periodic health checks")
-        
-        logger.info("\nInitializing bot application...")
-        await application.initialize()
-        
-        logger.info("Cleaning up previous webhook/polling sessions...")
-        try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Previous webhook deleted (if existed)")
-        except Exception as e:
-            logger.warning(f"Could not delete webhook: {e}")
-        
-        await asyncio.sleep(3)
-        
-        logger.info("Starting bot application...")
-        await application.start()
-        
-        # Start background tasks
-        logger.info("Starting background tasks...")
-        asyncio.create_task(process_generation_queue())
-        asyncio.create_task(auto_ping_service())
-        logger.info("✅ Background tasks started")
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("🚀 BOT IS NOW RUNNING IN POLLING MODE 🚀")
-        logger.info("=" * 60)
-        logger.info("Waiting for Telegram updates...\n")
-        
-        # Simply call run_polling() and let it handle everything
-        await application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=1.0,
-            timeout=10
-        )
-        # NEVER put await app.stop() after this - run_polling handles cleanup
-    
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set in config.py!")
         instance_lock.release()
         sys.exit(1)
+    
+    logger.info("=" * 60)
+    logger.info("Starting ClipFly Telegram Bot - POLLING MODE")
+    logger.info("Features: Queue System + Auto-Delete + 24/7 Keep-Alive")
+    logger.info("=" * 60)
+    
+    # Check for token file
+    if not os.path.exists(TOKEN_FILE):
+        logger.warning(f"{TOKEN_FILE} not found. Creating empty file...")
+        open(TOKEN_FILE, 'w').close()
+    
+    # Create images directory
+    ImageStorage.ensure_directory()
+    
+    # Create application
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Add all command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("model", model_command))
+    application.add_handler(CommandHandler("setmodel", setmodel_command))
+    application.add_handler(CommandHandler("mymodel", mymodel_command))
+    application.add_handler(CommandHandler("count", count_command))
+    application.add_handler(CommandHandler("setcount", setcount_command))
+    application.add_handler(CommandHandler("mycount", mycount_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("gen", gen_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("tokens", tokens_command))
+    
+    logger.info("✅ Queue system enabled - Max 1 concurrent generation")
+    logger.info("✅ Auto-delete enabled - Images deleted after sending")
+    logger.info("✅ Single instance mode - Only one bot instance allowed")
+    logger.info("✅ 24/7 Keep-alive enabled - Periodic health checks")
+    
+    logger.info("\nInitializing bot application...")
+    await application.initialize()
+    
+    logger.info("Cleaning up previous webhook/polling sessions...")
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Previous webhook deleted (if existed)")
+    except Exception as e:
+        logger.warning(f"Could not delete webhook: {e}")
+    
+    await asyncio.sleep(3)
+    
+    logger.info("Starting bot application...")
+    await application.start()
+    
+    # Start background tasks
+    logger.info("Starting background tasks...")
+    asyncio.create_task(process_generation_queue())
+    asyncio.create_task(auto_ping_service())
+    logger.info("✅ Background tasks started")
+    
+    logger.info("\n" + "=" * 60)
+    logger.info("🚀 BOT IS NOW RUNNING IN POLLING MODE 🚀")
+    logger.info("=" * 60)
+    logger.info("Waiting for Telegram updates...\n")
+    
+    # run_polling() will run indefinitely until interrupted
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=10
+    )
+
+# This prevents event loop conflicts - run_polling manages its own loop
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("\n✅ Bot stopped by user")
-        instance_lock.release()
         sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         import traceback
         traceback.print_exc()
-        instance_lock.release()
         sys.exit(1)
-    finally:
-        instance_lock.release()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
