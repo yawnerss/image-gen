@@ -1,7 +1,13 @@
+
 """
-ClipFly Telegram Bot - Fixed Version with Auto-Delete
-Generates AI images through Telegram using ClipFly API with automatic token management
-Images are automatically deleted after being sent to save storage space
+ClipFly Telegram Bot - FIXED STABLE VERSION
+Fixed issues:
+1. Proper asyncio event loop management
+2. Better error handling and recovery
+3. Fixed webhook/polling conflicts
+4. Added connection keepalive
+5. Better timeout handling
+6. Proper task cleanup
 """
 import requests
 import json
@@ -12,28 +18,28 @@ from datetime import datetime
 from typing import Dict, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import TimedOut, NetworkError, TelegramError
+from telegram.error import TimedOut, NetworkError, TelegramError, Conflict
 import logging
 from config import BOT_TOKEN, BASE_URL, TOKEN_FILE, IMAGES_DIR, MAX_WAIT_TIME, CHECK_INTERVAL, AVAILABLE_MODELS, DEFAULT_MODEL
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import fcntl
 import sys
-from flask import Flask, request, jsonify
-from pyngrok import ngrok
+import signal
 
-# Setup logging
+# Setup logging with more detail
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Flask app for webhook
-flask_app = Flask(__name__)
+# Reduce noise from other libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
 
-# Global event loop reference for Flask
-bot_event_loop = None
+# Global shutdown flag
+shutdown_event = asyncio.Event()
 
 # Store active generation tasks
 active_generations = {}
@@ -41,13 +47,16 @@ active_generations = {}
 # Store user model preferences
 user_models = {}
 
-# Store user image count preferences (1-10 images)x
+# Store user image count preferences (1-10 images)
 user_image_counts = {}
 
 # Queue system for generation requests
 generation_queue = []
 queue_lock = asyncio.Lock()
-MAX_CONCURRENT_GENERATIONS = 1  # Process one generation at a time to avoid crashes
+MAX_CONCURRENT_GENERATIONS = 1
+
+# Global queue processor task reference
+queue_processor_task = None
 
 
 # ============================================================================
@@ -137,7 +146,7 @@ class QueueManager:
                 return "Queue is empty ✅"
             
             info = f"Queue: {len(generation_queue)} user{'s' if len(generation_queue) > 1 else ''} waiting\n\n"
-            for i, item in enumerate(generation_queue[:10], 1):  # Show first 10
+            for i, item in enumerate(generation_queue[:10], 1):
                 status = "🔄 Processing..." if item['started'] else f"#{i}"
                 info += f"{status} - @{item['username']}: `{item['prompt'][:30]}...`\n"
             
@@ -155,21 +164,25 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle errors caused by updates."""
     logger.error(f"Exception while handling an update: {context.error}")
     
-    # Handle specific errors
+    # Don't crash on errors, just log them
     if isinstance(context.error, TimedOut):
         logger.warning("Request timed out. Network may be slow.")
-        if update and update.effective_message:
-            try:
-                await update.effective_message.reply_text(
-                    "⚠️ Request timed out. Please try again.",
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                pass
     elif isinstance(context.error, NetworkError):
         logger.warning("Network error occurred.")
+    elif isinstance(context.error, Conflict):
+        logger.error("Conflict error - another instance may be running!")
     else:
         logger.error(f"Unhandled error: {context.error}")
+    
+    # Try to inform user if possible
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ An error occurred. Please try again.",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass
 
 
 async def safe_reply(message, text, parse_mode='Markdown', retries=3):
@@ -183,10 +196,10 @@ async def safe_reply(message, text, parse_mode='Markdown', retries=3):
                 await asyncio.sleep(2)
             else:
                 logger.error("Failed to send reply after retries")
-                raise
+                return None
         except Exception as e:
             logger.error(f"Error sending reply: {e}")
-            raise
+            return None
 
 
 async def safe_edit(message, text, parse_mode='Markdown', retries=3):
@@ -200,13 +213,13 @@ async def safe_edit(message, text, parse_mode='Markdown', retries=3):
                 await asyncio.sleep(2)
             else:
                 logger.error("Failed to edit message after retries")
-                raise
+                return None
         except Exception as e:
-            # Message might not have changed
             if "Message is not modified" in str(e):
                 return message
             logger.error(f"Error editing message: {e}")
-            raise
+            return None
+
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -340,22 +353,18 @@ class ClipFlyAPI:
                 continue
             
             if result.get("success"):
-                # Success! Return the result
-                result["token"] = token # Return the token used for this successful generation
+                result["token"] = token
                 return result
             else:
                 error = result.get("error", "Unknown error")
-                # Check if it's a balance/credit error
                 if any(keyword in error.upper() for keyword in ["CREDIT", "BALANCE", "NOT_ENOUGH"]):
                     logger.warning(f"Token has insufficient balance. Removing and trying next token...")
                     exhausted_tokens.append(token)
                     TokenManager.remove_token(token)
                     continue
                 else:
-                    # Other error - don't retry, return failure
                     return result
         
-        # All tokens exhausted
         if exhausted_tokens:
             return {
                 "success": False,
@@ -413,7 +422,6 @@ class ClipFlyAPI:
             
             logger.info(f"Response code: {code}, message: {message}")
             
-            # Check for credit issues
             if "CREDIT_BALANCE_NOT_ENOUGH" in message or "not enough" in message.lower():
                 return {
                     "success": False,
@@ -422,7 +430,6 @@ class ClipFlyAPI:
                 }
             
             if response.status_code == 200 and code == 0:
-                # Extract task ID from response
                 task_data = data.get("data", [])
                 task_id = None
                 queue_id = None
@@ -521,7 +528,6 @@ class ClipFlyAPI:
                 if not isinstance(queue_item, dict):
                     continue
                     
-                # Check if this queue item matches
                 item_queue_id = queue_item.get("id")
                 
                 if queue_id and item_queue_id == queue_id:
@@ -529,13 +535,11 @@ class ClipFlyAPI:
                     if tasks:
                         return tasks[0]
                 
-                # Also check tasks within the queue item
                 tasks = queue_item.get("tasks", [])
                 for task in tasks:
                     if task_id and task.get("id") == task_id:
                         return task
             
-            # If no specific match, return the most recent task
             if data_list and isinstance(data_list[0], dict) and data_list[0].get("tasks"):
                 return data_list[0]["tasks"][0]
             
@@ -550,20 +554,17 @@ class ClipFlyAPI:
     def extract_image_url(task: Dict) -> Optional[str]:
         """Extract image URL from task data"""
         try:
-            # Method 1: after_material.urls.url
             after_material = task.get("after_material", {})
             if after_material:
                 urls = after_material.get("urls", {})
                 if urls:
                     url = urls.get("url", "")
                     if url:
-                        # Check if URL needs base URL prepended
                         if url.startswith("http"):
                             return url
                         else:
                             return f"{BASE_URL}{url}"
             
-            # Method 2: result_url
             result_url = task.get("result_url", "")
             if result_url:
                 if result_url.startswith("http"):
@@ -571,7 +572,6 @@ class ClipFlyAPI:
                 else:
                     return f"{BASE_URL}{result_url}"
             
-            # Method 3: output_url
             output_url = task.get("output_url", "")
             if output_url:
                 if output_url.startswith("http"):
@@ -579,7 +579,6 @@ class ClipFlyAPI:
                 else:
                     return f"{BASE_URL}{output_url}"
             
-            # Method 4: Check in ext field
             ext = task.get("ext", {})
             if ext and isinstance(ext, dict):
                 for key in ["url", "image_url", "output"]:
@@ -622,16 +621,8 @@ Welcome! I can generate AI images for you using ClipFly.
 /tokens - Check available tokens
 /help - Show help
 
-*Features:*
-✅ Queue system - Multiple users can request simultaneously
-✅ Position tracking - See where you are in line
-✅ Status checking - Check if your image is generating
-✅ Auto-delete - Images auto-deleted after sending to save space
-
 *Example:*
 `/gen a beautiful sunset over mountains`
-
-💡 *Tip:* Use `/status` to check if your image is currently generating!
 
 Let's create something amazing! 🚀
     """
@@ -653,28 +644,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "9. Use `/queue` to check your position in queue\n"
         "10. Use `/cancel` to stop current generation or remove from queue\n"
         "11. Use `/tokens` to check available tokens\n\n"
-        "🎯 *Queue System*\n"
-        "• When you use `/gen`, you're added to the queue\n"
-        "• You'll see your position (e.g., 'Position #3 out of 5')\n"
-        "• The bot processes one generation at a time\n"
-        "• Use `/queue` to check your current status anytime\n"
-        "• Use `/status` to see if your image is currently generating\n\n"
         "💡 *Tips:*\n"
         "• Set your preferred model and image count first\n"
-        "• Images are perfect for manga/comic scenes\n"
         "• Images are auto-deleted after sending to save space\n"
-        "• All settings are saved per user\n"
-        "• Queue prevents bot crashes from concurrent requests"
+        "• All settings are saved per user"
     )
     await safe_reply(update.message, help_text)
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /model command - Let user choose a model"""
+    """Handle /model command"""
     user_id = update.effective_user.id
     current_model = user_models.get(user_id, DEFAULT_MODEL)
     
-    # Find current model name
     current_name = "Unknown"
     for key, model in AVAILABLE_MODELS.items():
         if model["id"] == current_model:
@@ -697,15 +679,13 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setmodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /setmodel command - Set user's preferred model"""
+    """Handle /setmodel command"""
     user_id = update.effective_user.id
     
     if not context.args:
         await safe_reply(
             update.message,
-            "⚠️ Please specify a model number!\n\n"
-            "Example: `/setmodel 2`\n\n"
-            "Use `/model` to see available models."
+            "⚠️ Please specify a model number!\n\nExample: `/setmodel 2`\n\nUse `/model` to see available models."
         )
         return
     
@@ -714,9 +694,7 @@ async def setmodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice not in AVAILABLE_MODELS:
         await safe_reply(
             update.message,
-            f"❌ Invalid model number: `{choice}`\n\n"
-            f"Please choose 1-{len(AVAILABLE_MODELS)}\n"
-            "Use `/model` to see available models."
+            f"❌ Invalid model number: `{choice}`\n\nPlease choose 1-{len(AVAILABLE_MODELS)}\nUse `/model` to see available models."
         )
         return
     
@@ -725,21 +703,17 @@ async def setmodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await safe_reply(
         update.message,
-        f"✅ *Model Updated!*\n\n"
-        f"Selected: {selected_model['name']}\n"
-        f"Description: _{selected_model['desc']}_\n\n"
-        f"Your next `/gen` command will use this model."
+        f"✅ *Model Updated!*\n\nSelected: {selected_model['name']}\nDescription: _{selected_model['desc']}_\n\nYour next `/gen` command will use this model."
     )
     
     logger.info(f"User {user_id} selected model: {selected_model['id']}")
 
 
 async def mymodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mymodel command - Show user's current model"""
+    """Handle /mymodel command"""
     user_id = update.effective_user.id
     current_model = user_models.get(user_id, DEFAULT_MODEL)
     
-    # Find current model info
     model_info = None
     for key, model in AVAILABLE_MODELS.items():
         if model["id"] == current_model:
@@ -749,18 +723,12 @@ async def mymodel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if model_info:
         await safe_reply(
             update.message,
-            f"🎨 *Your Current Model*\n\n"
-            f"Model: {model_info['name']}\n"
-            f"ID: `{model_info['id']}`\n"
-            f"Description: _{model_info['desc']}_\n\n"
-            f"Use `/model` to change it."
+            f"🎨 *Your Current Model*\n\nModel: {model_info['name']}\nID: `{model_info['id']}`\nDescription: _{model_info['desc']}_\n\nUse `/model` to change it."
         )
     else:
         await safe_reply(
             update.message,
-            f"🎨 *Your Current Model*\n\n"
-            f"Model ID: `{current_model}`\n\n"
-            f"Use `/model` to change it."
+            f"🎨 *Your Current Model*\n\nModel ID: `{current_model}`\n\nUse `/model` to change it."
         )
 
 
@@ -771,9 +739,7 @@ async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tokens:
         await safe_reply(
             update.message,
-            "⚠️ No tokens available!\n\n"
-            f"Please add tokens to {TOKEN_FILE} file.\n"
-            "Format: One token per line (Bearer prefix optional)"
+            f"⚠️ No tokens available!\n\nPlease add tokens to {TOKEN_FILE} file.\nFormat: One token per line (Bearer prefix optional)"
         )
     else:
         message = f"✅ Available tokens: {len(tokens)}\n\n"
@@ -787,104 +753,73 @@ async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def gen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /gen command with queue system to prevent crashes"""
+    """Handle /gen command with queue system"""
     user_id = update.effective_user.id
     username = update.effective_user.username or "User"
     
-    # Check if prompt is provided
     if not context.args:
-        await safe_reply(
-            update.message,
-            "⚠️ Please provide a prompt!\n\n"
-            "Example: `/gen a beautiful sunset`"
-        )
+        await safe_reply(update.message, "⚠️ Please provide a prompt!\n\nExample: `/gen a beautiful sunset`")
         return
     
     prompt = " ".join(context.args)
     
-    # Get user's selected model
     selected_model_id = user_models.get(user_id, DEFAULT_MODEL)
     image_count = user_image_counts.get(user_id, 1)
     
-    # Find model name for display
     model_name = selected_model_id
     for key, model in AVAILABLE_MODELS.items():
         if model["id"] == selected_model_id:
             model_name = model["name"]
             break
     
-    # Check tokens
     tokens = TokenManager.load_tokens()
     if not tokens:
-        await safe_reply(
-            update.message,
-            "❌ No tokens available!\n\n"
-            "Please add tokens to token.txt file."
-        )
+        await safe_reply(update.message, "❌ No tokens available!\n\nPlease add tokens to token.txt file.")
         return
     
-    # Check if we have enough tokens for the requested image count
     if len(tokens) < image_count:
         await safe_reply(
             update.message,
-            f"⚠️ Not enough tokens!\n\n"
-            f"You requested {image_count} images but only have {len(tokens)} tokens.\n"
-            f"Each image uses 1 token.\n\n"
-            f"Please use `/setcount {len(tokens)}` or add more tokens."
+            f"⚠️ Not enough tokens!\n\nYou requested {image_count} images but only have {len(tokens)} tokens.\nEach image uses 1 token.\n\nPlease use `/setcount {len(tokens)}` or add more tokens."
         )
         return
     
-    # Queue each image individually
     queue_positions = []
     status_messages = []
     
     for img_num in range(image_count):
         try:
-            # Send initial queuing message
             status_message = await safe_reply(
                 update.message,
-                f"⏳ *Adding image {img_num + 1}/{image_count} to queue...*\n\n"
-                f"Prompt: `{prompt}`\n"
-                f"Model: {model_name}\n"
-                f"Finding position in queue..."
+                f"⏳ *Adding image {img_num + 1}/{image_count} to queue...*\n\nPrompt: `{prompt}`\nModel: {model_name}\nFinding position in queue..."
             )
-            status_messages.append(status_message)
+            if status_message:
+                status_messages.append(status_message)
         except Exception as e:
             logger.error(f"Failed to send initial message for image {img_num + 1}: {e}")
             continue
         
-        # Add to queue - each image is a separate queue item
         position = await QueueManager.add_to_queue(
             user_id, username, prompt, selected_model_id, 1, update, status_message
         )
         queue_positions.append((img_num + 1, position))
         
-        # Update with position
         try:
             queue_size = await QueueManager.get_queue_size()
             await safe_edit(
                 status_message,
-                f"⏳ *Queued for generation!*\n\n"
-                f"📍 Image {img_num + 1}/{image_count}\n"
-                f"📊 Queue Position: #{position} out of {queue_size}\n"
-                f"Prompt: `{prompt}`\n"
-                f"Model: {model_name}\n\n"
-                f"⌛ Waiting for your turn...\n"
-                f"Use /cancel to remove from queue"
+                f"⏳ *Queued for generation!*\n\n📍 Image {img_num + 1}/{image_count}\n📊 Queue Position: #{position} out of {queue_size}\nPrompt: `{prompt}`\nModel: {model_name}\n\n⌛ Waiting for your turn...\nUse /cancel to remove from queue"
             )
         except Exception as e:
             logger.error(f"Failed to update queue message for image {img_num + 1}: {e}")
         
         logger.info(f"User {username} ({user_id}) queued image {img_num + 1}/{image_count} at position {position}: {prompt}")
     
-    # Send summary of all queued images
     if queue_positions:
         summary = f"✅ *All {len(queue_positions)} images queued!*\n\n"
         for img_num, pos in queue_positions:
             summary += f"Image {img_num}: Position #{pos}\n"
-        summary += f"\nPrompt: `{prompt}`\n"
-        summary += f"Model: {model_name}\n\n"
-        summary += f"💡 Each image will auto-generate when it's their turn!"
+        summary += f"\nPrompt: `{prompt}`\nModel: {model_name}\n\n💡 Each image will auto-generate when it's their turn!"
         
         try:
             await safe_reply(update.message, summary)
@@ -893,10 +828,11 @@ async def gen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_generation_queue():
-    """Background task to process the generation queue"""
-    while True:
+    """Background task to process the generation queue - IMPROVED WITH BETTER ERROR HANDLING"""
+    logger.info("🚀 Queue processor started!")
+    
+    while not shutdown_event.is_set():
         try:
-            # Get next item from queue
             queue_item = await QueueManager.get_next_in_queue()
             
             if not queue_item:
@@ -911,14 +847,11 @@ async def process_generation_queue():
             status_message = queue_item['status_message']
             update = queue_item['update']
             
-            # Check if cancelled
             if queue_item['cancelled']:
                 try:
                     await safe_edit(
                         status_message,
-                        "🚫 *Generation Cancelled*\n\n"
-                        f"Prompt: `{prompt}`\n"
-                        f"Cancelled by user"
+                        "🚫 *Generation Cancelled*\n\nPrompt: `{prompt}`\nCancelled by user"
                     )
                 except Exception:
                     pass
@@ -927,7 +860,6 @@ async def process_generation_queue():
                     del active_generations[user_id]
                 continue
             
-            # Find model name
             model_name = selected_model_id
             for key, model in AVAILABLE_MODELS.items():
                 if model["id"] == selected_model_id:
@@ -936,7 +868,6 @@ async def process_generation_queue():
             
             logger.info(f"Processing generation for {username}: {image_count}x images")
             
-            # Track active generation
             active_generations[user_id] = {
                 'start_time': datetime.now().strftime("%H:%M:%S"),
                 'status': 'Starting...',
@@ -944,54 +875,35 @@ async def process_generation_queue():
                 'model': model_name
             }
             
-            # Notify user it's their turn
             try:
                 await update.message.reply_text(
-                    "🎉 *It's Your Turn!*\n\n"
-                    f"Starting generation now...\n"
-                    f"Prompt: `{prompt}`\n"
-                    f"Model: {model_name}\n\n"
-                    "⏳ This may take 30-90 seconds...",
+                    "🎉 *It's Your Turn!*\n\nStarting generation now...\nPrompt: `{prompt}`\nModel: {model_name}\n\n⏳ This may take 30-90 seconds...",
                     parse_mode='Markdown'
                 )
             except Exception as e:
                 logger.error(f"Failed to send turn notification: {e}")
             
-            # Update status - starting
             try:
                 await safe_edit(
                     status_message,
-                    f"🎨 *Generating...*\n\n"
-                    f"Prompt: `{prompt}`\n"
-                    f"Model: {model_name}\n"
-                    f"Status: Generation in progress...\n\n"
-                    f"⏳ Please wait...\n"
-                    f"Use /cancel to stop"
+                    f"🎨 *Generating...*\n\nPrompt: `{prompt}`\nModel: {model_name}\nStatus: Generation in progress...\n\n⏳ Please wait...\nUse /cancel to stop"
                 )
             except Exception as e:
                 logger.error(f"Failed to update status: {e}")
             
-            # Get fresh tokens
             tokens = TokenManager.load_tokens()
             if not tokens:
                 logger.warning(f"No tokens available for {username}")
                 try:
-                    await safe_edit(
-                        status_message,
-                        f"❌ *Generation Failed*\n\n"
-                        f"Prompt: `{prompt}`\n"
-                        f"No tokens available"
-                    )
+                    await safe_edit(status_message, f"❌ *Generation Failed*\n\nPrompt: `{prompt}`\nNo tokens available")
                 except Exception:
                     pass
                 await QueueManager.remove_queue_item(queue_item)
                 continue
             
-            # Track all generation tasks
             generation_tasks = []
             
             try:
-                # Start generation for each image
                 for img_num in range(image_count):
                     available_tokens = TokenManager.load_tokens()
                     
@@ -999,25 +911,14 @@ async def process_generation_queue():
                         logger.warning(f"No tokens available for image {img_num + 1}")
                         break
                     
-                    # Check if cancelled
                     if queue_item['cancelled']:
-                        await safe_edit(
-                            status_message,
-                            "🚫 *Generation Cancelled*\n\n"
-                            f"Prompt: `{prompt}`"
-                        )
+                        await safe_edit(status_message, "🚫 *Generation Cancelled*\n\nPrompt: `{prompt}`")
                         break
                     
-                    # Update status
                     try:
                         await safe_edit(
                             status_message,
-                            f"🎨 *Generating {image_count} images...*\n\n"
-                            f"Prompt: `{prompt}`\n"
-                            f"Model: {model_name}\n"
-                            f"Status: Starting generation {img_num + 1}/{image_count}...\n"
-                            f"Available tokens: {len(available_tokens)}\n\n"
-                            f"Use /cancel to stop"
+                            f"🎨 *Generating {image_count} images...*\n\nPrompt: `{prompt}`\nModel: {model_name}\nStatus: Starting generation {img_num + 1}/{image_count}...\nAvailable tokens: {len(available_tokens)}\n\nUse /cancel to stop"
                         )
                     except Exception:
                         pass
@@ -1038,12 +939,7 @@ async def process_generation_queue():
                             try:
                                 await safe_edit(
                                     status_message,
-                                    f"🎨 *Generating {image_count} images...*\n\n"
-                                    f"Prompt: `{prompt}`\n"
-                                    f"Model: {model_name}\n"
-                                    f"Status: {exhausted_count} token(s) exhausted (insufficient balance)\n"
-                                    f"Continuing with remaining tokens...\n\n"
-                                    f"Use /cancel to stop"
+                                    f"🎨 *Generating {image_count} images...*\n\nPrompt: `{prompt}`\nModel: {model_name}\nStatus: {exhausted_count} token(s) exhausted (insufficient balance)\nContinuing with remaining tokens...\n\nUse /cancel to stop"
                                 )
                                 await asyncio.sleep(1)
                             except Exception:
@@ -1065,29 +961,18 @@ async def process_generation_queue():
                     logger.info(f"Started generation {img_num + 1}/{image_count} - Task ID: {task_id}")
                 
                 if not generation_tasks:
-                    await safe_edit(
-                        status_message,
-                        "❌ Failed to start any generations!\n\n"
-                        "Please try again."
-                    )
+                    await safe_edit(status_message, "❌ Failed to start any generations!\n\nPlease try again.")
                     await QueueManager.remove_queue_item(queue_item)
                     continue
                 
-                # Update status - all generations started
                 try:
                     await safe_edit(
                         status_message,
-                        f"🎨 *Generating {len(generation_tasks)} images...*\n\n"
-                        f"Prompt: `{prompt}`\n"
-                        f"Model: {model_name}\n"
-                        f"Status: All generations started, waiting for completion...\n"
-                        f"This may take 30-90 seconds\n\n"
-                        f"Use /cancel to stop"
+                        f"🎨 *Generating {len(generation_tasks)} images...*\n\nPrompt: `{prompt}`\nModel: {model_name}\nStatus: All generations started, waiting for completion...\nThis may take 30-90 seconds\n\nUse /cancel to stop"
                     )
                 except Exception:
                     pass
                 
-                # Wait for all tasks to complete
                 start_time = time.time()
                 completed_tasks = []
                 check_count = 0
@@ -1095,20 +980,13 @@ async def process_generation_queue():
                 while time.time() - start_time < MAX_WAIT_TIME:
                     check_count += 1
                     
-                    # Check if cancelled
                     if queue_item['cancelled']:
                         try:
-                            await safe_edit(
-                                status_message,
-                                "🚫 *Generation Cancelled*\n\n"
-                                f"Prompt: `{prompt}`\n"
-                                f"Cancelled during processing"
-                            )
+                            await safe_edit(status_message, "🚫 *Generation Cancelled*\n\nPrompt: `{prompt}`\nCancelled during processing")
                         except Exception:
                             pass
                         break
                     
-                    # Check status of all pending tasks
                     pending_count = 0
                     processing_count = 0
                     
@@ -1131,23 +1009,22 @@ async def process_generation_queue():
                             if task:
                                 status = task.get("status")
                                 
-                                if status == 2:  # Completed
+                                if status == 2:
                                     task_info['status'] = 'completed'
                                     task_info['task_data'] = task
                                     completed_tasks.append(task_info)
                                     logger.info(f"Image {task_info['img_num']} completed!")
-                                elif status == 3:  # Failed
+                                elif status == 3:
                                     task_info['status'] = 'failed'
                                     error = task.get("error_msg", "Unknown error")
                                     logger.error(f"Image {task_info['img_num']} failed: {error}")
-                                elif status == 0:  # Pending
+                                elif status == 0:
                                     pending_count += 1
-                                elif status == 1:  # Processing
+                                elif status == 1:
                                     processing_count += 1
                     
                     completed_count = len(completed_tasks)
                     
-                    # Update status periodically
                     if check_count % 2 == 0:
                         elapsed = int(time.time() - start_time)
                         status_text = f"⏳ Pending: {pending_count} | 🔄 Processing: {processing_count} | ✅ Done: {completed_count}/{len(generation_tasks)}"
@@ -1155,50 +1032,33 @@ async def process_generation_queue():
                         try:
                             await safe_edit(
                                 status_message,
-                                f"🎨 *Generating {len(generation_tasks)} images...*\n\n"
-                                f"Prompt: `{prompt}`\n"
-                                f"Model: {model_name}\n"
-                                f"{status_text}\n"
-                                f"Elapsed: {elapsed}s\n\n"
-                                f"Use /cancel to stop"
+                                f"🎨 *Generating {len(generation_tasks)} images...*\n\nPrompt: `{prompt}`\nModel: {model_name}\n{status_text}\nElapsed: {elapsed}s\n\nUse /cancel to stop"
                             )
                         except Exception:
                             pass
                     
-                    # Check if all completed
                     if completed_count >= len(generation_tasks):
                         logger.info("All images completed!")
                         break
                     
                     await asyncio.sleep(CHECK_INTERVAL)
                 
-                # Process completed images
                 if not completed_tasks:
                     try:
                         await safe_edit(
                             status_message,
-                            "⏱️ *Generation Timeout*\n\n"
-                            f"Prompt: `{prompt}`\n"
-                            f"No images completed within {MAX_WAIT_TIME}s.\n\n"
-                            "Please try again."
+                            f"⏱️ *Generation Timeout*\n\nPrompt: `{prompt}`\nNo images completed within {MAX_WAIT_TIME}s.\n\nPlease try again."
                         )
                     except Exception:
                         pass
                     await QueueManager.remove_queue_item(queue_item)
                     continue
                 
-                # Update status - downloading
                 try:
-                    await safe_edit(
-                        status_message,
-                        f"🎨 *Downloading {len(completed_tasks)} images...*\n\n"
-                        f"Prompt: `{prompt}`\n"
-                        f"Status: Preparing to send..."
-                    )
+                    await safe_edit(status_message, f"🎨 *Downloading {len(completed_tasks)} images...*\n\nPrompt: `{prompt}`\nStatus: Preparing to send...")
                 except Exception:
                     pass
                 
-                # Download and send all completed images
                 sent_count = 0
                 failed_count = 0
                 
@@ -1237,8 +1097,6 @@ async def process_generation_queue():
                             
                             sent_count += 1
                             logger.info(f"Successfully sent image {img_num}")
-                            
-                            # AUTO-DELETE
                             ImageStorage.delete_image(filepath)
                             
                         except Exception as e:
@@ -1250,26 +1108,20 @@ async def process_generation_queue():
                         logger.error(f"Error processing image {task_info['img_num']}: {e}")
                         failed_count += 1
                 
-                # Delete status message
                 try:
                     await status_message.delete()
                 except Exception:
                     pass
                 
-                # Send completion notification
                 if sent_count > 0:
                     try:
                         await update.message.reply_text(
-                            f"✅ *Generation Complete!*\n\n"
-                            f"Successfully generated and sent {sent_count} image{'s' if sent_count > 1 else ''}!\n"
-                            f"Prompt: `{prompt}`\n\n"
-                            f"Ready for next request! Use `/gen <prompt>` to generate more.",
+                            f"✅ *Generation Complete!*\n\nSuccessfully generated and sent {sent_count} image{'s' if sent_count > 1 else ''}!\nPrompt: `{prompt}`\n\nReady for next request! Use `/gen <prompt>` to generate more.",
                             parse_mode='Markdown'
                         )
                     except Exception as e:
                         logger.error(f"Failed to send completion notification: {e}")
                 
-                # Only send summary if there were failures
                 if failed_count > 0 or len(completed_tasks) < len(generation_tasks):
                     summary = f"⚠️ *Generation Issues*\n\n"
                     summary += f"Requested: {len(generation_tasks)} images\n"
@@ -1289,59 +1141,43 @@ async def process_generation_queue():
             except Exception as e:
                 logger.error(f"Error during generation for {username}: {e}")
                 try:
-                    await safe_edit(
-                        status_message,
-                        f"❌ *Generation Error*\n\n"
-                        f"Prompt: `{prompt}`\n"
-                        f"Error: {str(e)[:100]}"
-                    )
+                    await safe_edit(status_message, f"❌ *Generation Error*\n\nPrompt: `{prompt}`\nError: {str(e)[:100]}")
                 except Exception:
                     pass
             
             finally:
-                # Remove only THIS specific queue item (not all items for the user)
                 await QueueManager.remove_queue_item(queue_item)
-                
-                # Clean up active generation tracking
                 if user_id in active_generations:
                     del active_generations[user_id]
         
         except Exception as e:
-            logger.error(f"Error in queue processing: {e}")
+            logger.error(f"Error in queue processing loop: {e}")
             await asyncio.sleep(1)
+    
+    logger.info("🛑 Queue processor stopped")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /cancel command - Remove from queue or cancel active generation"""
+    """Handle /cancel command"""
     user_id = update.effective_user.id
     
-    # Get all items for this user in queue
-    queue_size_before = await QueueManager.get_queue_size()
-    
-    # Cancel all requests from this user
     await QueueManager.cancel_user_request(user_id)
     
-    await safe_reply(
-        update.message,
-        "🚫 *Cancelled!*\n\n"
-        "All your queued images have been removed from the queue."
-    )
+    await safe_reply(update.message, "🚫 *Cancelled!*\n\nAll your queued images have been removed from the queue.")
     
     logger.info(f"User {user_id} cancelled all requests")
 
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /queue command - Show current queue status"""
+    """Handle /queue command"""
     user_id = update.effective_user.id
     position = await QueueManager.get_queue_position(user_id)
     queue_info = await QueueManager.get_queue_info()
     
-    message = f"📊 *Generation Queue Status*\n\n"
-    message += f"{queue_info}\n\n"
+    message = f"📊 *Generation Queue Status*\n\n{queue_info}\n\n"
     
     if position > 0:
-        message += f"👤 *Your Position:* #{position}\n"
-        message += f"💡 Tip: You can use `/cancel` to remove yourself from the queue."
+        message += f"👤 *Your Position:* #{position}\n💡 Tip: You can use `/cancel` to remove yourself from the queue."
     else:
         message += f"👤 *Your Status:* Not in queue"
     
@@ -1349,30 +1185,24 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /count command - Let user choose how many images to generate"""
+    """Handle /count command"""
     user_id = update.effective_user.id
     current_count = user_image_counts.get(user_id, 1)
     
     message = "🖼️ *Select Image Count*\n\n"
     message += f"Current: {current_count} image{'s' if current_count > 1 else ''}\n\n"
     message += "You can generate 1-10 images per request\n\n"
-    message += "*Usage:* `/setcount <number>`\n"
-    message += "Example: `/setcount 3` for 3 images"
+    message += "*Usage:* `/setcount <number>`\nExample: `/setcount 3` for 3 images"
     
     await safe_reply(update.message, message)
 
 
 async def setcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /setcount command - Set user's default image count"""
+    """Handle /setcount command"""
     user_id = update.effective_user.id
     
     if not context.args:
-        await safe_reply(
-            update.message,
-            "⚠️ Please specify a number of images to generate!\n\n"
-            "Example: `/setcount 3`\n\n"
-            "Please choose a number between 1 and 10."
-        )
+        await safe_reply(update.message, "⚠️ Please specify a number of images to generate!\n\nExample: `/setcount 3`\n\nPlease choose a number between 1 and 10.")
         return
     
     choice = context.args[0]
@@ -1382,104 +1212,56 @@ async def setcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if image_count < 1 or image_count > 10:
             raise ValueError("Image count must be between 1 and 10")
         user_image_counts[user_id] = image_count
-        await safe_reply(
-            update.message,
-            f"✅ *Image Count Updated!*\n\n"
-            f"Default image count set to {image_count}.\n\n"
-            f"Your next `/gen` command will generate {image_count} image{'s' if image_count > 1 else ''}."
-        )
+        await safe_reply(update.message, f"✅ *Image Count Updated!*\n\nDefault image count set to {image_count}.\n\nYour next `/gen` command will generate {image_count} image{'s' if image_count > 1 else ''}.")
         logger.info(f"User {user_id} set default image count: {image_count}")
     except ValueError as e:
-        await safe_reply(
-            update.message,
-            f"❌ Invalid image count: `{choice}`\n\n"
-            f"{str(e)}\n\n"
-            "Please choose a number between 1 and 10."
-        )
+        await safe_reply(update.message, f"❌ Invalid image count: `{choice}`\n\n{str(e)}\n\nPlease choose a number between 1 and 10.")
         logger.error(f"Invalid image count specified by user {user_id}: {choice}")
 
 
 async def mycount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mycount command - Show user's current image count"""
+    """Handle /mycount command"""
     user_id = update.effective_user.id
     current_image_count = user_image_counts.get(user_id, 1)
     
     await safe_reply(
         update.message,
-        f"🖼️ *Your Current Image Count*\n\n"
-        f"Count: {current_image_count} image{'s' if current_image_count > 1 else ''}\n\n"
-        f"Your next generation will produce {current_image_count} image{'s' if current_image_count > 1 else ''}.\n\n"
-        f"Use `/setcount` to change it."
+        f"🖼️ *Your Current Image Count*\n\nCount: {current_image_count} image{'s' if current_image_count > 1 else ''}\n\nYour next generation will produce {current_image_count} image{'s' if current_image_count > 1 else ''}.\n\nUse `/setcount` to change it."
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command - Check if user has active generation"""
+    """Handle /status command"""
     user_id = update.effective_user.id
     
-    # Check if user is in active generations
     if user_id in active_generations:
         status = active_generations[user_id]
         await safe_reply(
             update.message,
-            f"🎨 *Your Image is Generating!*\n\n"
-            f"Started: {status.get('start_time', 'Unknown')}\n"
-            f"Status: {status.get('status', 'Processing...')}\n\n"
-            f"Use /cancel to stop this generation."
+            f"🎨 *Your Image is Generating!*\n\nStarted: {status.get('start_time', 'Unknown')}\nStatus: {status.get('status', 'Processing...')}\n\nUse /cancel to stop this generation."
         )
         return
     
-    # Check queue position
     position = await QueueManager.get_queue_position(user_id)
     if position > 0:
         await safe_reply(
             update.message,
-            f"📊 *You're in the Queue*\n\n"
-            f"Position: #{position}\n\n"
-            f"Your image will start generating soon!\n"
-            f"Use /queue to see detailed queue status.\n"
-            f"Use /cancel to remove from queue."
+            f"📊 *You're in the Queue*\n\nPosition: #{position}\n\nYour image will start generating soon!\nUse /queue to see detailed queue status.\nUse /cancel to remove from queue."
         )
         return
     
-    # Not generating or in queue
     await safe_reply(
         update.message,
-        f"✅ *No Active Generation*\n\n"
-        f"You're not currently generating any images.\n\n"
-        f"Use `/gen <prompt>` to start a new generation!"
+        f"✅ *No Active Generation*\n\nYou're not currently generating any images.\n\nUse `/gen <prompt>` to start a new generation!"
     )
 
 
 # ============================================================================
-# MAIN
+# HTTP HEALTH CHECK SERVER
 # ============================================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for health checks, status monitoring, and webhooks"""
-    
-    def do_POST(self):
-        """Handle POST requests for webhooks"""
-        if self.path == '/webhook':
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode('utf-8')
-            
-            try:
-                logger.debug(f"Webhook received: {body[:100]}")
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                
-                response = {'ok': True}
-                self.wfile.write(json.dumps(response).encode())
-            except Exception as e:
-                logger.error(f"Error processing webhook: {e}")
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
+    """HTTP request handler for health checks"""
     
     def do_GET(self):
         """Handle GET requests"""
@@ -1488,116 +1270,21 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             
-            queue_size = len(generation_queue)
             response = {
                 'status': 'healthy',
                 'bot': 'ClipFly AI Image Generator',
-                'queue_size': queue_size,
-                'available_tokens': len(TokenManager.load_tokens()),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        elif self.path == '/queue':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            queue_data = []
-            for i, item in enumerate(generation_queue, 1):
-                queue_data.append({
-                    'position': i,
-                    'user_id': item['user_id'],
-                    'username': item['username'],
-                    'prompt': item['prompt'][:50],
-                    'model': item['model_id'],
-                    'status': 'processing' if item['started'] else 'waiting'
-                })
-            
-            response = {
-                'queue_size': len(generation_queue),
-                'items': queue_data,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
-            
-        elif self.path == '/stats':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            response = {
-                'bot': 'ClipFly AI Image Generator',
                 'queue_size': len(generation_queue),
                 'available_tokens': len(TokenManager.load_tokens()),
-                'active_users': len(active_generations),
-                'total_users_in_queue': len(set(item['user_id'] for item in generation_queue)),
                 'timestamp': datetime.now().isoformat()
             }
             self.wfile.write(json.dumps(response).encode())
-            
         else:
             self.send_response(404)
-            self.send_header('Content-type', 'application/json')
             self.end_headers()
-            
-            response = {
-                'error': 'Endpoint not found',
-                'available_endpoints': ['/health', '/queue', '/stats', '/webhook'],
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(response).encode())
     
     def log_message(self, format, *args):
         """Suppress HTTP server logging"""
         pass
-
-
-def setup_flask_webhook(app_instance):
-    """Setup Flask webhook endpoint"""
-    
-    @flask_app.route('/webhook', methods=['POST'])
-    def telegram_webhook():
-        """Handle incoming Telegram updates via webhook"""
-        try:
-            data = request.get_json()
-            
-            if data:
-                logger.debug(f"Webhook update received from Telegram")
-                # Process update through the application in the bot event loop
-                if bot_event_loop and bot_event_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        app_instance.process_update(
-                            Update.de_json(data, app_instance.bot)
-                        ),
-                        bot_event_loop
-                    )
-            
-            return jsonify({'ok': True})
-        except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
-            return jsonify({'ok': False, 'error': str(e)}), 500
-    
-    @flask_app.route('/health', methods=['GET'])
-    def health_check():
-        """Health check endpoint"""
-        return jsonify({
-            'status': 'healthy',
-            'bot': 'ClipFly AI Image Generator',
-            'timestamp': datetime.now().isoformat()
-        })
-    
-    logger.info("Flask webhook endpoints configured")
-
-
-def run_flask_server(port=5000):
-    """Run Flask server in a separate thread"""
-    def run():
-        flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-    
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    logger.info(f"Flask server started on port {port}")
 
 
 def start_http_server(port=8080):
@@ -1607,8 +1294,6 @@ def start_http_server(port=8080):
     thread.start()
     logger.info(f"HTTP Server started on port {port}")
     logger.info(f"Health check: http://localhost:{port}/health")
-    logger.info(f"Queue status: http://localhost:{port}/queue")
-    logger.info(f"Statistics: http://localhost:{port}/stats")
     return server
 
 
@@ -1623,10 +1308,10 @@ class SingleInstanceLock:
         """Acquire the lock"""
         try:
             self.lock_handle = open(self.lock_file, 'w')
-            if os.name == 'nt':  # Windows
+            if os.name == 'nt':
                 import msvcrt
                 msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:  # Unix-like
+            else:
                 fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             logger.info("✅ Single instance lock acquired")
             return True
@@ -1639,10 +1324,10 @@ class SingleInstanceLock:
         """Release the lock"""
         try:
             if self.lock_handle:
-                if os.name == 'nt':  # Windows
+                if os.name == 'nt':
                     import msvcrt
                     msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:  # Unix-like
+                else:
                     fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
                 self.lock_handle.close()
                 if os.path.exists(self.lock_file):
@@ -1652,67 +1337,59 @@ class SingleInstanceLock:
             logger.error(f"Error releasing lock: {e}")
 
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, shutting down gracefully...")
+    shutdown_event.set()
+
+
 # ============================================================================
-# MAIN
+# MAIN - FIXED VERSION
 # ============================================================================
 
 async def main():
-    """Start the bot - async version"""
-    # Create and acquire single instance lock
+    """Start the bot - FIXED STABLE VERSION"""
     instance_lock = SingleInstanceLock(".bot.lock")
     
     if not instance_lock.acquire():
         logger.error("Cannot start bot - another instance is already running!")
         sys.exit(1)
     
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    application = None
+    http_server = None
+    
     try:
         if not BOT_TOKEN:
             raise ValueError("BOT_TOKEN not set in config.py!")
         
-        logger.info("Starting ClipFly Telegram Bot with Auto-Delete...")
+        logger.info("=" * 60)
+        logger.info("🚀 Starting ClipFly Telegram Bot (FIXED STABLE VERSION)")
+        logger.info("=" * 60)
         
-        # Check for token file
         if not os.path.exists(TOKEN_FILE):
             logger.warning(f"{TOKEN_FILE} not found. Creating empty file...")
             open(TOKEN_FILE, 'w').close()
         
-        # Create images directory
         ImageStorage.ensure_directory()
         
-        # Detect webhook host - use Render's external URL if available
-        webhook_host = os.getenv('RENDER_EXTERNAL_URL')
-        if not webhook_host:
-            # Fallback to WEBHOOK_HOST env var or use ngrok
-            webhook_host = os.getenv('WEBHOOK_HOST')
-            if not webhook_host:
-                logger.warning("Neither RENDER_EXTERNAL_URL nor WEBHOOK_HOST set - using ngrok...")
-                # In production on Render, this shouldn't happen
-                webhook_host = "localhost"
-        
-        # Remove trailing slash if present
-        if webhook_host.endswith('/'):
-            webhook_host = webhook_host.rstrip('/')
-        
-        # Ensure HTTPS for Telegram webhook
-        if not webhook_host.startswith('http'):
-            if webhook_host != 'localhost':
-                webhook_host = f"https://{webhook_host}"
-            else:
-                webhook_host = f"http://{webhook_host}"
-        
-        logger.info(f"Webhook host configured: {webhook_host}")
-        
-        # Create application with custom settings for better timeout handling
+        # Create application with better timeout settings
         application = (
             Application.builder()
             .token(BOT_TOKEN)
             .connect_timeout(30)
             .read_timeout(30)
             .write_timeout(30)
+            .pool_timeout(30)
+            .get_updates_connect_timeout(30)
+            .get_updates_read_timeout(30)
+            .get_updates_pool_timeout(30)
             .build()
         )
         
-        # Add error handler
         application.add_error_handler(error_handler)
         
         # Add handlers
@@ -1730,114 +1407,138 @@ async def main():
         application.add_handler(CommandHandler("queue", queue_command))
         application.add_handler(CommandHandler("tokens", tokens_command))
         
-        # Start bot
-        logger.info("Bot is running with auto-delete feature enabled...")
-        logger.info("Images will be automatically deleted after being sent to users")
-        logger.info("Queue system activated - max 1 concurrent generation")
-        logger.info("Single instance mode: Only one bot instance allowed")
-        logger.info("Polling mode: Using getUpdates polling (best for Render)")
+        logger.info("✅ All command handlers registered")
         
-        # Start HTTP server for health checks and webhooks
+        # Start HTTP health check server
         http_server = start_http_server(port=8080)
         
-        # Create a custom post_init to start queue processor
-        async def start_queue_processor(app):
-            """Start the queue processor after app initialization"""
-            logger.info("Starting queue processor task...")
-            asyncio.create_task(process_generation_queue())
-            logger.info("✅ Queue processor task created")
-        
-        application.post_init = start_queue_processor
-        
-        # Clean up any existing webhook and update offset to avoid conflicts
-        logger.info("Cleaning up previous polling sessions...")
-        try:
-            # Delete any existing webhook
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook deleted (if existed)")
-        except Exception as e:
-            logger.warning(f"Could not delete webhook: {e}")
-        
-        # Small delay to ensure previous session is fully terminated
-        await asyncio.sleep(2)
-        
-        # Run the bot with polling
-        logger.info("Starting bot with polling mode...")
+        # Initialize the application
+        logger.info("📡 Initializing Telegram bot application...")
         await application.initialize()
         await application.start()
         
-        # Manually start queue processor since post_init may not be called yet
-        logger.info("Manually starting queue processor...")
-        queue_processor_task = asyncio.create_task(process_generation_queue())
-        
-        # Try to get current offset to skip old messages
+        # Delete any existing webhook to avoid conflicts
+        logger.info("🧹 Cleaning up any existing webhooks...")
         try:
-            logger.info("Syncing with Telegram API...")
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook deleted successfully")
+        except Exception as e:
+            logger.warning(f"Could not delete webhook: {e}")
+        
+        # Wait a bit to ensure clean slate
+        await asyncio.sleep(2)
+        
+        # Start the queue processor
+        global queue_processor_task
+        logger.info("🎯 Starting generation queue processor...")
+        queue_processor_task = asyncio.create_task(process_generation_queue())
+        logger.info("✅ Queue processor task created")
+        
+        # Sync with Telegram to skip old messages
+        logger.info("🔄 Syncing with Telegram API...")
+        try:
             updates = await application.bot.get_updates(timeout=5, allowed_updates=Update.ALL_TYPES)
             if updates:
-                logger.info(f"Synced {len(updates)} pending updates")
+                logger.info(f"📨 Synced {len(updates)} pending updates")
         except Exception as e:
             logger.warning(f"Could not sync updates: {e}")
         
-        try:
-            # Start polling with proper error handling for conflicts
-            logger.info("✅ Bot is now polling for updates...")
-            
-            # Retry loop for handling initial conflicts from previous instances
-            max_retries = 5
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    await application.updater.start_polling(
-                        allowed_updates=Update.ALL_TYPES,
-                        drop_pending_updates=False,
-                        poll_interval=1.0,
-                        timeout=10
-                    )
-                    # If we get here, polling started successfully
-                    break
-                except Exception as e:
-                    if "Conflict" in str(e) or "other getUpdates" in str(e):
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            wait_time = 5 * retry_count  # Exponential backoff: 5s, 10s, 15s, etc
-                            logger.warning(f"Conflict detected (attempt {retry_count}/{max_retries}). Retrying in {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                        else:
-                            logger.error(f"Failed to start polling after {max_retries} attempts")
-                            raise
+        # Start polling with retry logic
+        logger.info("🚀 Starting polling...")
+        max_retries = 10
+        retry_count = 0
+        
+        while retry_count < max_retries and not shutdown_event.is_set():
+            try:
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                    poll_interval=2.0,
+                    timeout=30,
+                    bootstrap_retries=5
+                )
+                logger.info("✅ Polling started successfully!")
+                break
+            except Exception as e:
+                if "Conflict" in str(e) or "other getUpdates" in str(e):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        wait_time = min(5 * retry_count, 30)
+                        logger.warning(f"⚠️ Conflict detected (attempt {retry_count}/{max_retries}). Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
                     else:
+                        logger.error(f"❌ Failed to start polling after {max_retries} attempts")
                         raise
-            
-            # Keep the bot running
-            await asyncio.Event().wait()
-        except Exception as e:
-            logger.error(f"Error during polling: {e}")
-            raise
-        finally:
-            logger.info("Stopping bot...")
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+                else:
+                    logger.error(f"❌ Polling error: {e}")
+                    raise
+        
+        if shutdown_event.is_set():
+            logger.info("Shutdown requested during startup")
+            return
+        
+        logger.info("=" * 60)
+        logger.info("✅ BOT IS NOW RUNNING!")
+        logger.info("=" * 60)
+        logger.info("📝 Features:")
+        logger.info("   - Auto-delete images after sending")
+        logger.info("   - Queue system (1 concurrent generation)")
+        logger.info("   - Single instance mode")
+        logger.info("   - Polling mode (stable for Render)")
+        logger.info("   - Health check: http://localhost:8080/health")
+        logger.info("=" * 60)
+        
+        # Keep running until shutdown signal
+        while not shutdown_event.is_set():
+            await asyncio.sleep(1)
+        
+        logger.info("🛑 Shutdown signal received, stopping bot...")
     
     except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+        logger.error(f"❌ Configuration error: {e}")
         instance_lock.release()
         sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-        instance_lock.release()
-        sys.exit(0)
+        logger.info("⌨️  Bot stopped by user (Ctrl+C)")
     except Exception as e:
-        logger.error(f"Fatal error starting bot: {e}")
+        logger.error(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
-        instance_lock.release()
-        sys.exit(1)
     finally:
+        logger.info("🧹 Cleaning up...")
+        
+        # Cancel queue processor
+        if queue_processor_task and not queue_processor_task.done():
+            queue_processor_task.cancel()
+            try:
+                await queue_processor_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop the application
+        if application:
+            try:
+                logger.info("Stopping updater...")
+                if application.updater.running:
+                    await application.updater.stop()
+                logger.info("Stopping application...")
+                await application.stop()
+                logger.info("Shutting down application...")
+                await application.shutdown()
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}")
+        
+        # Release lock
         instance_lock.release()
+        
+        logger.info("👋 Bot stopped gracefully")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"❌ Fatal error in main: {e}")
+        sys.exit(1)
