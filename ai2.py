@@ -1578,7 +1578,6 @@ async def main():
         logger.info("\nInitializing bot application...")
         await application.initialize()
         
-        # Clean up any existing webhook
         logger.info("Cleaning up previous webhook/polling sessions...")
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
@@ -1597,62 +1596,19 @@ async def main():
         asyncio.create_task(auto_ping_service())
         logger.info("✅ Background tasks started")
         
-        try:
-            logger.info("\n" + "=" * 60)
-            logger.info("🚀 BOT IS NOW RUNNING IN POLLING MODE 🚀")
-            logger.info("=" * 60)
-            logger.info("Waiting for Telegram updates...")
-            
-            # Start polling with retry logic for connection conflicts
-            max_retries = 8
-            retry_count = 0
-            initial_wait = 3
-            
-            while retry_count < max_retries:
-                try:
-                    logger.info(f"Starting polling (attempt {retry_count + 1}/{max_retries})...")
-                    
-                    await application.updater.start_polling(
-                        allowed_updates=Update.ALL_TYPES,
-                        drop_pending_updates=True,
-                        poll_interval=1.0,
-                        timeout=10
-                    )
-                    logger.info("✅ Polling started successfully!")
-                    break
-                
-                except Exception as e:
-                    error_str = str(e)
-                    
-                    if "Conflict" in error_str or "getUpdates" in error_str:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            wait_time = initial_wait * (2 ** (retry_count - 1))
-                            wait_time = min(wait_time, 60)
-                            
-                            logger.warning(f"⚠️ Conflict: Another getUpdates session detected")
-                            logger.warning(f"Attempt {retry_count}/{max_retries} - Waiting {wait_time}s...")
-                            
-                            await asyncio.sleep(wait_time)
-                        else:
-                            logger.error(f"Failed to start polling after {max_retries} attempts")
-                            raise
-                    else:
-                        logger.error(f"Polling error: {error_str}")
-                        raise
-            
-            # Keep the bot running indefinitely
-            await asyncio.Event().wait()
+        logger.info("\n" + "=" * 60)
+        logger.info("🚀 BOT IS NOW RUNNING IN POLLING MODE 🚀")
+        logger.info("=" * 60)
+        logger.info("Waiting for Telegram updates...\n")
         
-        except Exception as e:
-            logger.error(f"Error during polling: {e}")
-            raise
-        
-        finally:
-            logger.info("\nStopping bot...")
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+        # Simply call run_polling() and let it handle everything
+        await application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=1.0,
+            timeout=10
+        )
+        # NEVER put await app.stop() after this - run_polling handles cleanup
     
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
