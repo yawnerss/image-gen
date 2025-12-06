@@ -40,10 +40,9 @@ AVAILABLE_MODELS = {
     "5": {"id": "gpt_1low", "name": "⚡ GPT-1 Low", "desc": "Fast generation"},
     "6": {"id": "gpt_1medium", "name": "🎯 GPT-1 Medium", "desc": "Better quality"},
     "7": {"id": "flux_kontext_pro", "name": "✨ Flux Kontext Pro", "desc": "Premium quality"},
-    "8": {"id": "flux_2_pro", "name": "FLUX KONTEXT PRO 2 ", "desc": "Vesion 2 of kontext pro"},
-    "9": {"id": "clipfly_2", "name": "Clipfly 2", "desc": "Clip fly version"},
-    "10": {"id": "midjourney_v7", "name": "MID JOURNEY V7", "desc": "MID JOURNEY V7 more detield texture"}
-    
+    "8": {"id": "flux_2_pro", "name": "🚀 Flux Kontext Pro 2", "desc": "Version 2 of Kontext Pro"},
+    "9": {"id": "clipfly_2", "name": "🎬 Clipfly 2", "desc": "Clipfly version"},
+    "10": {"id": "midjourney_v7", "name": "🎨 Midjourney V7", "desc": "Midjourney V7 - more detailed textures"}
 }
 
 DEFAULT_MODEL = "nanobanana"
@@ -52,5 +51,6 @@ DEFAULT_MODEL = "nanobanana"
 # LOGGING SETTINGS
 # ============================================================================
 LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
 
 
