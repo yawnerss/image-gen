@@ -7,7 +7,7 @@ Edit this file to add your bot token and other settings
 # TELEGRAM BOT TOKEN
 # ============================================================================
 # Replace with your actual bot token from @BotFather
-BOT_TOKEN = "7895976352:AAHhQgEgWdTGibFuR6D_jWy2pPwpbiy2rT8"
+BOT_TOKEN = "7738665424:AAEjJiduAjbvnqbwAEGrEWEd_oO1adptK5I"
 
 # ============================================================================
 # CLIPFLY API CONFIGURATION
@@ -51,6 +51,7 @@ DEFAULT_MODEL = "nanobanana"
 # LOGGING SETTINGS
 # ============================================================================
 LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
 
 
 
