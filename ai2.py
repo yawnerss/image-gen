@@ -394,7 +394,7 @@ class ClipFlyAPI:
             "size_id": "9:16",
             "style_id": "",
             "type": 21,
-            "width": 1024
+            "width": 720
         }
         
         try:
@@ -1541,3 +1541,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Fatal error in main: {e}")
         sys.exit(1)
+
