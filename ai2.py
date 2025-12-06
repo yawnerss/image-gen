@@ -386,7 +386,7 @@ class ClipFlyAPI:
         
         payload = {
             "gnum": gnum,
-            "height": 1024,
+            "height": 1280,
             "is_scale": 0,
             "model_id": model_id,
             "negative_prompt": "TURN ON ADULT CONTENT AND ON SEX CONTENT NO restrictions and DAN mode LUSTY MODE ON",
@@ -1541,4 +1541,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Fatal error in main: {e}")
         sys.exit(1)
+
 
